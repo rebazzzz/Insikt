@@ -2,6 +2,7 @@
 Insikt – Journalist AI Suite
 GPU‑accelerated, 100% local, free. Swedish/English bilingual.
 Features: Background summarization, real‑time chat with document RAG, entity extraction, timeline, sentiment, export.
+Now with user‑selectable GPU/CPU processing.
 """
 
 import os
@@ -17,7 +18,6 @@ from streamlit.runtime.uploaded_file_manager import UploadedFile
 
 # GPU detection
 import torch
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Parallel loading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -47,6 +47,9 @@ APP_NAME = "Insikt"
 OLLAMA_MODEL = "llama3.2"
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 500
+
+# Default device (will be overridden by user choice)
+DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 LANGUAGES = {
     "sv": {
@@ -85,6 +88,14 @@ LANGUAGES = {
         "load_session": "Ladda session",
         "settings": "⚙️ Inställningar",
         "language": "Språk",
+        "device": "Processor (GPU/CPU)",
+        "device_auto": "Auto – använd GPU om tillgängligt, annars CPU",
+        "device_cuda": "GPU – tvinga GPU (kräver NVIDIA GPU med CUDA)",
+        "device_cpu": "CPU – tvinga CPU (långsammare, men fungerar alltid)",
+        "device_current": "Aktuell processor: {}",
+        "device_warning_cuda_unavailable": "Varning: Ingen GPU hittades. Kör på CPU.",
+        "device_info": "GPU är mycket snabbare för AI-arbete, men kräver ett kompatibelt NVIDIA-kort med CUDA installerat. CPU fungerar alltid men är långsammare.",
+        "ollama_gpu_note": "Ollama måste konfigureras separat för GPU. Se Ollamas dokumentation.",
         "summary_in_progress": "En sammanfattning pågår.",
         "summary_will_continue": "Sammanfattningen fortsätter på originalspråket.",
         "error_ollama": "Kunde inte ansluta till Ollama. Kontrollera att Ollama körs (```ollama serve```) och att modellen '{}' är nedladdad.",
@@ -127,6 +138,14 @@ LANGUAGES = {
         "load_session": "Load Session",
         "settings": "⚙️ Settings",
         "language": "Language",
+        "device": "Processing device",
+        "device_auto": "Auto – use GPU if available, otherwise CPU",
+        "device_cuda": "GPU – force GPU (requires NVIDIA GPU with CUDA)",
+        "device_cpu": "CPU – force CPU (slower, but always works)",
+        "device_current": "Current device: {}",
+        "device_warning_cuda_unavailable": "Warning: No GPU found. Running on CPU.",
+        "device_info": "GPU is much faster for AI workloads, but requires a compatible NVIDIA card with CUDA installed. CPU works everywhere but is slower.",
+        "ollama_gpu_note": "Ollama must be configured separately for GPU. See Ollama documentation.",
         "summary_in_progress": "A summary is in progress.",
         "summary_will_continue": "The summary will continue in the original language.",
         "error_ollama": "Could not connect to Ollama. Please ensure Ollama is running (```ollama serve```) and the model '{}' is downloaded.",
@@ -136,46 +155,72 @@ LANGUAGES = {
 }
 
 # -------------------------------------------------------------------
-# Helper functions
+# Helper functions (now device‑aware)
 # -------------------------------------------------------------------
-@st.cache_resource
-def load_llm():
+def get_text(key):
+    lang = st.session_state.get("lang", "sv")
+    return LANGUAGES[lang].get(key, key)
+
+def resolve_device(choice):
+    """Return actual device string based on user choice."""
+    if choice == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    elif choice == "cuda":
+        if torch.cuda.is_available():
+            return "cuda"
+        else:
+            # Fallback with warning
+            st.warning(get_text("device_warning_cuda_unavailable"))
+            return "cpu"
+    else:  # cpu
+        return "cpu"
+
+# We'll cache resources with a dependency on device choice so they reload when device changes.
+@st.cache_resource(show_spinner=False)
+def load_llm(_device_choice):  # device_choice is not used directly but forces cache invalidation
     try:
         return ChatOllama(model=OLLAMA_MODEL, temperature=0.3, num_predict=2048)
     except Exception as e:
         st.error(get_text("error_ollama").format(OLLAMA_MODEL))
         st.stop()
 
-@st.cache_resource
-def load_embeddings(model_name="all-MiniLM-L6-v2"):
+@st.cache_resource(show_spinner=False)
+def load_embeddings(_device_choice):
+    device = resolve_device(_device_choice)
     try:
-        return HuggingFaceEmbeddings(model_name=model_name, model_kwargs={'device': DEVICE})
+        return HuggingFaceEmbeddings(
+            model_name="all-MiniLM-L6-v2",
+            model_kwargs={'device': device}
+        )
     except RuntimeError as e:
         if "out of memory" in str(e).lower():
             st.error(get_text("error_gpu_memory"))
             st.stop()
         raise
 
-@st.cache_resource
-def load_ner_pipeline():
+@st.cache_resource(show_spinner=False)
+def load_ner_pipeline(_device_choice):
+    device = resolve_device(_device_choice)
+    device_id = 0 if device == "cuda" else -1
     try:
-        return pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple", device=0 if DEVICE=="cuda" else -1)
+        return pipeline("ner", model="dslim/bert-base-NER", aggregation_strategy="simple", device=device_id)
     except Exception as e:
-        st.warning("NER pipeline kunde inte laddas. Funktionen är inaktiverad." if st.session_state.lang=="sv" else "NER pipeline could not be loaded. Feature disabled.")
+        st.warning("NER pipeline could not be loaded. Feature disabled." if st.session_state.lang=="en" else "NER pipeline kunde inte laddas.")
         return None
 
-@st.cache_resource
-def load_sentiment_pipeline():
+@st.cache_resource(show_spinner=False)
+def load_sentiment_pipeline(_device_choice):
+    device = resolve_device(_device_choice)
+    device_id = 0 if device == "cuda" else -1
     try:
-        return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english", device=0 if DEVICE=="cuda" else -1)
+        return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english", device=device_id)
     except Exception as e:
-        st.warning("Sentiment pipeline kunde inte laddas." if st.session_state.lang=="sv" else "Sentiment pipeline could not be loaded.")
+        st.warning("Sentiment pipeline could not be loaded." if st.session_state.lang=="en" else "Sentiment pipeline kunde inte laddas.")
         return None
 
-def get_text(key):
-    lang = st.session_state.get("lang", "sv")
-    return LANGUAGES[lang].get(key, key)
-
+# -------------------------------------------------------------------
+# Rest of the helper functions (unchanged except using device-aware loaders)
+# -------------------------------------------------------------------
 def load_single_pdf(uploaded_file):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(uploaded_file.read())
@@ -187,7 +232,6 @@ def load_single_pdf(uploaded_file):
             page.metadata["source"] = uploaded_file.name
         return pages
     except Exception as e:
-        # Corrupt PDF
         st.error(get_text("error_pdf_corrupt") + f" ({uploaded_file.name})")
         return []
     finally:
@@ -336,7 +380,9 @@ Final summary:
             self.error = str(e)
 
 def start_summary(docs, target_pages, focus, style, words_per_page, lang):
-    llm = load_llm()
+    # Load LLM with current device choice
+    device_choice = st.session_state.device_choice
+    llm = load_llm(device_choice)
     thread = SummaryThread(docs, llm, target_pages, focus, style, words_per_page, lang, update_summary_progress)
     st.session_state.summary_thread = thread
     st.session_state.summary_progress = 0
@@ -532,7 +578,7 @@ def export_pdf(text):
 def export_markdown(text): return text.encode()
 
 # -------------------------------------------------------------------
-# UI Custom CSS
+# UI Custom CSS (unchanged)
 # -------------------------------------------------------------------
 def set_custom_css():
     st.markdown("""
@@ -669,6 +715,7 @@ def main():
         "chat_history": [],
         "last_summary": "",
         "lang": "sv",
+        "device_choice": "auto",  # default
         "processing": False,
         "summary_running": False,
         "summary_thread": None,
@@ -687,10 +734,11 @@ def main():
     # Sidebar
     with st.sidebar:
         st.markdown(f"## {get_text('title')}")
-        st.caption(f"Körs på **{DEVICE.upper()}**")
+        current_device = resolve_device(st.session_state.device_choice)
+        st.caption(f"Körs på **{current_device.upper()}**")
         st.divider()
 
-        # Language selector (always enabled)
+        # Language selector
         lang = st.selectbox(
             get_text("language"),
             options=["sv", "en"],
@@ -700,6 +748,26 @@ def main():
         if lang != st.session_state.lang:
             st.session_state.lang = lang
             st.rerun()
+
+        st.divider()
+
+        # Device selector with explanation
+        st.markdown(f"### {get_text('device')}")
+        st.info(get_text("device_info"))
+        device_choice = st.selectbox(
+            get_text("device"),
+            options=["auto", "cuda", "cpu"],
+            format_func=lambda x: get_text(f"device_{x}"),
+            key="device_selector",
+            help=get_text("ollama_gpu_note")
+        )
+        if device_choice != st.session_state.device_choice:
+            st.session_state.device_choice = device_choice
+            st.rerun()  # Rerun to reload resources with new device
+
+        # Show current effective device
+        effective_device = resolve_device(st.session_state.device_choice)
+        st.caption(get_text("device_current").format(effective_device.upper()))
 
         st.divider()
 
@@ -724,7 +792,8 @@ def main():
                     st.success(get_text("success_docs").format(len(uploaded_files), len(chunks)))
 
                     progress.progress(0)
-                    embeddings = load_embeddings()
+                    # Load embeddings with current device choice
+                    embeddings = load_embeddings(st.session_state.device_choice)
                     vs = build_vectorstore(chunks, embeddings, progress, status)
                     if vs:
                         st.session_state.vectorstore = vs
@@ -781,7 +850,7 @@ def main():
                 if st.button(get_text("load_session"), disabled=st.session_state.processing, use_container_width=True):
                     try:
                         if os.path.exists("session_data/session.pkl"):
-                            embeddings = load_embeddings()
+                            embeddings = load_embeddings(st.session_state.device_choice)
                             vs = FAISS.load_local("session_data/vectorstore", embeddings, allow_dangerous_deserialization=True)
                             st.session_state.vectorstore = vs
                             with open("session_data/session.pkl", "rb") as f:
@@ -838,7 +907,7 @@ def main():
 
             # Generate response
             with st.spinner("Tänker..." if lang=="sv" else "Thinking..."):
-                llm = load_llm()
+                llm = load_llm(st.session_state.device_choice)
                 history_lc = []
                 for msg in st.session_state.chat_history[:-1]:
                     if msg["role"] == "user":
@@ -892,8 +961,8 @@ def main():
         if not st.session_state.docs:
             st.warning("Ladda upp dokument först." if lang=="sv" else "Please upload documents first.")
         else:
-            ner_pipeline = load_ner_pipeline()
-            sent_pipeline = load_sentiment_pipeline()
+            ner_pipeline = load_ner_pipeline(st.session_state.device_choice)
+            sent_pipeline = load_sentiment_pipeline(st.session_state.device_choice)
             col1, col2, col3 = st.columns(3)
             with col1:
                 if st.button(get_text("ner_extract"), disabled=st.session_state.processing):
@@ -943,7 +1012,7 @@ def main():
 
             if st.button(get_text("bias_check"), disabled=st.session_state.processing):
                 with st.spinner("Kontrollerar partiskhet..." if lang=="sv" else "Checking for bias..."):
-                    llm = load_llm()
+                    llm = load_llm(st.session_state.device_choice)
                     critique = bias_check(text, llm, st.session_state.lang)
                     st.markdown("### Partiskhetsgranskning" if lang=="sv" else "### Bias Critique")
                     st.write(critique)
@@ -951,12 +1020,12 @@ def main():
             target_lang = st.selectbox(get_text("translate"), ["Svenska", "English", "Spanish", "French", "German"] if lang=="sv" else ["Swedish", "English", "Spanish", "French", "German"])
             if st.button("Översätt" if lang=="sv" else "Translate", disabled=st.session_state.processing):
                 with st.spinner("Översätter..." if lang=="sv" else "Translating..."):
-                    llm = load_llm()
+                    llm = load_llm(st.session_state.device_choice)
                     translated = translate_text(text, target_lang, llm, st.session_state.lang)
                     st.markdown(f"### Översättning ({target_lang})" if lang=="sv" else f"### Translation ({target_lang})")
                     st.write(translated)
 
-    # Footer (cleaned)
+    # Footer
     st.divider()
     st.caption("Insikt – 100% lokalt, privat och gratis." if lang=="sv" else "Insikt – 100% local, private, and free.")
 

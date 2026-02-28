@@ -1,0 +1,13 @@
+streamlit
+torch
+transformers
+langchain
+langchain-community
+langchain-core
+faiss-cpu
+pypdf
+python-docx
+fpdf
+markdown
+yake
+sentence-transformers

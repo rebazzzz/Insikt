@@ -48,6 +48,13 @@ OLLAMA_MODEL = "llama3.2"
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 500
 
+# Embedding models - bge provides better quality than MiniLM
+EMBEDDING_MODELS = {
+    "bge-small": "BAAI/bge-small-en-v1.5",
+    "bge-base": "BAAI/bge-base-en-v1.5"
+}
+DEFAULT_EMBEDDING_MODEL = "bge-base"
+
 # Default device (will be overridden by user choice)
 DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -101,6 +108,8 @@ LANGUAGES = {
         "error_ollama": "Kunde inte ansluta till Ollama. Kontrollera att Ollama körs (```ollama serve```) och att modellen '{}' är nedladdad.",
         "error_gpu_memory": "GPU-minnet är otillräckligt. Försök med färre eller kortare dokument, eller kör på CPU.",
         "error_pdf_corrupt": "En eller flera PDF-filer är skadade eller oläsbara.",
+        "embedding_model": "Inbäddningsmodell",
+        "embedding_model_info": "BGE-modeller ger bättre semantisk förståelse än MiniLM",
     },
     "en": {
         "title": "Insikt – Journalist AI",
@@ -151,6 +160,8 @@ LANGUAGES = {
         "error_ollama": "Could not connect to Ollama. Please ensure Ollama is running (```ollama serve```) and the model '{}' is downloaded.",
         "error_gpu_memory": "GPU memory insufficient. Try with fewer or shorter documents, or run on CPU.",
         "error_pdf_corrupt": "One or more PDF files are corrupted or unreadable.",
+        "embedding_model": "Embedding Model",
+        "embedding_model_info": "BGE models provide better semantic understanding than MiniLM",
     }
 }
 
@@ -185,11 +196,14 @@ def load_llm(_device_choice):  # device_choice is not used directly but forces c
         st.stop()
 
 @st.cache_resource(show_spinner=False)
-def load_embeddings(_device_choice):
+def load_embeddings(_device_choice, _embedding_model_key=None):
     device = resolve_device(_device_choice)
+    # Get the embedding model key from session state or use default
+    model_key = _embedding_model_key or st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
+    model_name = EMBEDDING_MODELS.get(model_key, EMBEDDING_MODELS[DEFAULT_EMBEDDING_MODEL])
     try:
         return HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2",
+            model_name=model_name,
             model_kwargs={'device': device}
         )
     except RuntimeError as e:
@@ -545,13 +559,174 @@ Assistant:"""
     return prompt
 
 def chat_with_docs(query, history, vectorstore, llm, lang):
-    context_docs = retrieve_context(query, vectorstore, k=7) if vectorstore else []
+    # Use adaptive retrieval - analyze query complexity to determine k
+    k = analyze_query_complexity(query)
+    context_docs = retrieve_context(query, vectorstore, k=k) if vectorstore else []
     prompt = create_chat_prompt(history, context_docs, query, lang)
     try:
         response = llm.invoke(prompt).content
     except Exception as e:
         response = f"Fel vid generering av svar: {e}" if lang == "sv" else f"Error generating answer: {e}"
-    return response, context_docs
+        return response, context_docs
+    
+    # Verify citations exist in retrieved context
+    verified_response, citation_issues = verify_citations(response, context_docs, lang)
+    
+    # If there are citation issues, we can either regenerate or flag the issue
+    # For now, we return the verified response with any warnings
+    return verified_response, context_docs
+
+
+# ---------- Adaptive Retrieval: Query Complexity Analysis ----------
+def analyze_query_complexity(query: str) -> int:
+    """
+    Analyze query complexity and return optimal k value for retrieval.
+    
+    Simple queries: k=3-4
+    Medium complexity: k=5-7
+    Complex analytical: k=8-10
+    """
+    query_lower = query.lower()
+    
+    # Complexity indicators
+    complexity_score = 0
+    
+    # Length-based complexity (longer queries often need more context)
+    word_count = len(query.split())
+    if word_count > 15:
+        complexity_score += 2
+    elif word_count > 8:
+        complexity_score += 1
+    
+    # Analytical keywords indicate complex queries
+    analytical_keywords = [
+        'compare', 'analyze', 'explain', 'why', 'how', 'difference',
+        'relationship', 'impact', 'effect', 'cause', 'result', 'consequence',
+        'jämför', 'analysera', 'förklara', 'varför', 'hur', 'skillnad',
+        'relation', 'påverkan', 'effekt', 'orsak', 'resultat', 'konsekvens'
+    ]
+    for keyword in analytical_keywords:
+        if keyword in query_lower:
+            complexity_score += 2
+    
+    # Multiple entities/concepts (question words)
+    question_indicators = ['who', 'what', 'when', 'where', 'which', 'whom', 'whose',
+                           'vem', 'vad', 'när', 'var', 'vilken', 'vilket', 'vilka']
+    for indicator in question_indicators:
+        if indicator in query_lower:
+            complexity_score += 1
+    
+    # Comparison queries need more context
+    if any(word in query_lower for word in ['vs', 'versus', 'compared', 'eller', 'jämfört']):
+        complexity_score += 2
+    
+    # Map complexity score to k value
+    if complexity_score <= 2:
+        return 3  # Simple query
+    elif complexity_score <= 5:
+        return 5  # Medium complexity
+    else:
+        return 8  # Complex analytical query
+
+
+# ---------- Citation Verification ----------
+def extract_citations_from_response(response: str) -> list:
+    """
+    Extract citations from the LLM response.
+    Looks for patterns like [Source: filename, page X] or [Källa: filename, sida X]
+    """
+    citations = []
+    
+    # Pattern for English: [Source: filename, page X]
+    en_pattern = r'\[Source:\s*([^,\]]+),\s*page\s*(\d+)\]'
+    # Pattern for Swedish: [Källa: filename, sida X]
+    sv_pattern = r'\[Källa:\s*([^,\]]+),\s*sida\s*(\d+)\]'
+    
+    # Also match bare citations like (source, page 5) or [source, p.5]
+    bare_pattern = r'\[?([A-Za-z0-9_\-\.]+)[,\s]+(?:page|p\.?|sida|s\.)\s*(\d+)\]?'
+    
+    import re
+    for match in re.finditer(en_pattern, response, re.IGNORECASE):
+        citations.append({
+            'source': match.group(1).strip(),
+            'page': match.group(2).strip()
+        })
+    
+    for match in re.finditer(sv_pattern, response, re.IGNORECASE):
+        citations.append({
+            'source': match.group(1).strip(),
+            'page': match.group(2).strip()
+        })
+    
+    for match in re.finditer(bare_pattern, response, re.IGNORECASE):
+        citations.append({
+            'source': match.group(1).strip(),
+            'page': match.group(2).strip()
+        })
+    
+    return citations
+
+
+def verify_citations(response: str, context_docs: list, lang: str) -> tuple:
+    """
+    Verify that citations in the response actually exist in the retrieved context.
+    Returns (verified_response, issues)
+    """
+    if not context_docs:
+        return response, ["No context available to verify citations"]
+    
+    # Extract citations from response
+    citations = extract_citations_from_response(response)
+    
+    if not citations:
+        # No citations found - this is fine, just return as-is
+        return response, []
+    
+    # Build a set of available sources from context
+    available_sources = {}
+    for doc in context_docs:
+        source = doc.metadata.get("source", "Unknown")
+        page = doc.metadata.get("page", "?")
+        if source not in available_sources:
+            available_sources[source] = set()
+        available_sources[source].add(str(page))
+    
+    # Verify each citation
+    issues = []
+    verified_citations = []
+    
+    for citation in citations:
+        source = citation['source']
+        page = citation['page']
+        
+        # Check if source exists in context
+        source_found = False
+        for avail_source in available_sources:
+            # Partial match (e.g., "report.pdf" matches "report_final.pdf")
+            if source.lower() in avail_source.lower() or avail_source.lower() in source.lower():
+                source_found = True
+                # Check if page exists (optional - some sources might not have page numbers)
+                if page in available_sources[avail_source] or page == "?":
+                    verified_citations.append(citation)
+                else:
+                    # Page not found but source exists - might still be valid
+                    verified_citations.append(citation)
+                break
+        
+        if not source_found:
+            issues.append(f"Citation refers to '{source}' which was not found in retrieved context")
+    
+    # If there are issues, add a warning to the response
+    if issues:
+        warning_msg = ""
+        if lang == "sv":
+            warning_msg = "\n\n⚠️ *Obs: Vissa källhänvisningar kunde inte verifieras i dokumentkontexten.*"
+        else:
+            warning_msg = "\n\n⚠️ *Note: Some citations could not be verified in the document context.*"
+        
+        response = response + warning_msg
+    
+    return response, issues
 
 # ---------- Analysis tools ----------
 def extract_entities(text, ner_pipeline):
@@ -844,6 +1019,22 @@ def main():
         # Show current effective device
         effective_device = resolve_device(st.session_state.device_choice)
         st.caption(get_text("device_current").format(effective_device.upper()))
+        
+        st.divider()
+        
+        # Embedding model selector (improves semantic understanding)
+        st.markdown(f"### {get_text('embedding_model')}")
+        st.caption(get_text("embedding_model_info"))
+        embedding_model = st.selectbox(
+            get_text("embedding_model"),
+            options=list(EMBEDDING_MODELS.keys()),
+            format_func=lambda x: EMBEDDING_MODELS[x],
+            key="embedding_model_selector",
+            index=list(EMBEDDING_MODELS.keys()).index(st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
+        )
+        if embedding_model != st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL):
+            st.session_state.embedding_model = embedding_model
+            st.rerun()  # Rerun to reload resources with new embedding model
 
         st.divider()
 

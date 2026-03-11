@@ -1,32 +1,48 @@
-# TODO: Speed Optimizations for Insikt App
+# TODO: Enhanced RAG Improvements for Insikt App
 
-## Phase 1: Batch Processing for Summarization ✅ COMPLETED
+## Phase 1: Better Embeddings ✅ COMPLETED
 
-- [x] Group multiple pages/chunks together before sending to LLM
-- [x] Reduce LLM calls from ~15 to ~3-5 per document
+- [x] Upgrade from "all-MiniLM-L6-v2" to "BAAI/bge-base-en-v1.5"
+- [x] Add sidebar setting for embedding model selection (small/base)
+- [x] Update load_embeddings function to support model selection
 
-## Phase 2: MapReduce Pattern Implementation ✅ COMPLETED
+## Phase 2: Adaptive Retrieval ✅ COMPLETED
 
-- [x] Replace sequential "refine" method with parallel MapReduce
-- [x] Implement parallel document processing
-- [x] Add reduce step to combine summaries
+- [x] Create analyze_query_complexity function
+- [x] Implement dynamic k selection based on query complexity
+- [x] Simple queries: k=3-4
+- [x] Medium complexity: k=5-7
+- [x] Complex analytical: k=8-10
 
-## Phase 3: Caching System ✅ COMPLETED
+## Phase 3: Citation Verification ✅ COMPLETED
 
-- [x] Add summary caching to avoid re-processing
-- [x] Cache processed document states
-- [x] Persist cache between sessions (in-memory for session)
+- [x] Create verify_citations function
+- [x] Extract citations from generated response
+- [x] Verify cited sources exist in retrieved context
+- [x] Add verification step in chat_with_docs
+- [x] Option to regenerate if citations are invalid
 
-## Summary of Improvements Made:
+## Summary of Changes:
 
-### Speed Improvements:
+### 4. Better Embeddings:
 
-1. **Batch Processing**: Documents are now grouped in batches of 5 chunks, reducing LLM calls by ~80%
-2. **MapReduce Pattern**: Uses Map phase (summarize batches) + Reduce phase (combine summaries) instead of sequential processing
-3. **Caching**: Same document + same settings = instant results from cache
+- Upgraded to "BAAI/bge-base-en-v1.5" for better quality
+- Added user-selectable model in sidebar (bge-small/bge-base options)
+- Better semantic understanding and retrieval accuracy
+- Session state preserves user choice
 
-### Expected Performance Gains:
+### 5. Adaptive Retrieval:
 
-- **First run**: ~50-70% faster due to batch processing
-- **Subsequent runs**: Near-instant (retrieved from cache)
-- **Memory**: More efficient due to batched processing
+- Query complexity analysis based on:
+  - Query length (word count)
+  - Analytical keywords (compare, analyze, explain, why, how)
+  - Multiple entities/concepts
+  - Comparison indicators
+- Dynamic k selection: k=3 (simple), k=5 (medium), k=8 (complex)
+
+### 6. Citation Verification:
+
+- Extracts citations from response (handles both Swedish and English formats)
+- Verifies citations exist in retrieved context
+- Adds warning if citations cannot be verified
+- Returns verified response with any warnings

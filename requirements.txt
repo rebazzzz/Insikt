@@ -4,6 +4,8 @@ transformers
 langchain
 langchain-community
 langchain-core
+langchain-huggingface
+langchain-ollama
 faiss-cpu
 pypdf
 python-docx

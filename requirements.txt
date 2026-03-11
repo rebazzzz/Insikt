@@ -13,3 +13,4 @@ fpdf
 markdown
 yake
 sentence-transformers
+numpy

@@ -44,14 +44,93 @@ import yake
 # Configuration & Language
 # -------------------------------------------------------------------
 APP_NAME = "Insikt"
-OLLAMA_MODEL = "llama3.2"
+
+# LLM Models - Optimized for performance and accuracy
+# Quantized models are smaller, faster, and use less memory while maintaining good quality
+LLM_MODELS = {
+    "llama3.2": {
+        "display_name": "Llama 3.2 (Standard)",
+        "display_name_en": "Llama 3.2 (Standard)",
+        "description": "Bästa kvalitet men kräver mer minne. Rekommenderas för kraftfulla datorer.",
+        "description_en": "Best quality but requires more memory. Recommended for powerful computers.",
+        "speed": "⚡⚡",
+        "quality": "⭐⭐⭐⭐⭐",
+        "memory": "High",
+    },
+    "llama3.2:3b": {
+        "display_name": "Llama 3.2 3B (Snabb)",
+        "display_name_en": "Llama 3.2 3B (Fast)",
+        "description": "Snabbare och mindre minneskrävande. Bra balans mellan hastighet och kvalitet.",
+        "description_en": "Faster and less memory intensive. Good balance between speed and quality.",
+        "speed": "⚡⚡⚡⚡",
+        "quality": "⭐⭐⭐⭐",
+        "memory": "Medium",
+    },
+    "llama3.2:1b": {
+        "display_name": "Llama 3.2 1B (Turbo)",
+        "display_name_en": "Llama 3.2 1B (Turbo)",
+        "description": "Snabbast och minst minneskrävande. För svagare datorer eller quick tests.",
+        "description_en": "Fastest and most memory efficient. For weaker computers or quick tests.",
+        "speed": "⚡⚡⚡⚡⚡",
+        "quality": "⭐⭐⭐",
+        "memory": "Low",
+    },
+    "mistral:7b": {
+        "display_name": "Mistral 7B",
+        "display_name_en": "Mistral 7B",
+        "description": "Alternativ modell med bra prestanda. Bra för engelska dokument.",
+        "description_en": "Alternative model with good performance. Good for English documents.",
+        "speed": "⚡⚡⚡",
+        "quality": "⭐⭐⭐⭐",
+        "memory": "High",
+    },
+}
+DEFAULT_LLM_MODEL = "llama3.2:3b"  # Default to fast quantized model
+
+# Chunking strategies
+CHUNKING_STRATEGIES = {
+    "semantic": {
+        "display_name": "Smart (Semantisk)",
+        "display_name_en": "Smart (Semantic)",
+        "description": "Delar dokument baserat på mening och sammanhang. Bäst för längre dokument.",
+        "description_en": "Splits documents based on meaning and context. Best for longer documents.",
+        "icon": "🧠",
+    },
+    "fixed": {
+        "display_name": "Standard (Fast storlek)",
+        "display_name_en": "Standard (Fixed size)",
+        "description": "Delar dokument i jämna delar. Snabbare men mindre flexibelt.",
+        "description_en": "Splits documents into equal parts. Faster but less flexible.",
+        "icon": "📏",
+    },
+}
+DEFAULT_CHUNKING = "semantic"
+
+OLLAMA_MODEL = DEFAULT_LLM_MODEL
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 500
 
 # Embedding models - bge provides better quality than MiniLM
+# User-friendly explanations added for non-technical users
 EMBEDDING_MODELS = {
-    "bge-small": "BAAI/bge-small-en-v1.5",
-    "bge-base": "BAAI/bge-base-en-v1.5"
+    "bge-small": {
+        "model_name": "BAAI/bge-small-en-v1.5",
+        "display_name": "Snabb (bge-small)",  # Fast (bge-small)
+        "display_name_en": "Fast (bge-small)",
+        "description": "Snabbare, mindre noggrann. Bra för testning och svaga datorer.",  # Faster, less accurate. Good for testing and weak computers.
+        "description_en": "Faster, less accurate. Good for testing and weaker computers.",
+        "speed": "⚡⚡⚡⚡⚡",  # 5 lightning bolts for fastest
+        "quality": "⭐⭐",    # 2 stars for quality
+    },
+    "bge-base": {
+        "model_name": "BAAI/bge-base-en-v1.5",
+        "display_name": "Balanserad (bge-base)",  # Balanced (bge-base)
+        "display_name_en": "Balanced (bge-base)",
+        "description": "Bästa valet! Balans mellan hastighet och noggrannhet.",  # Best choice! Balance between speed and accuracy.
+        "description_en": "Best choice! Balance between speed and accuracy.",
+        "speed": "⚡⚡⚡⚡",   # 4 lightning bolts
+        "quality": "⭐⭐⭐",  # 3 stars for quality
+    }
 }
 DEFAULT_EMBEDDING_MODEL = "bge-base"
 
@@ -188,11 +267,13 @@ def resolve_device(choice):
 
 # We'll cache resources with a dependency on device choice so they reload when device changes.
 @st.cache_resource(show_spinner=False)
-def load_llm(_device_choice):  # device_choice is not used directly but forces cache invalidation
+def load_llm(_device_choice, _model_key=None):  # device_choice is not used directly but forces cache invalidation
+    # Get the model from session state or use default
+    model_key = _model_key or st.session_state.get("llm_model", DEFAULT_LLM_MODEL)
     try:
-        return ChatOllama(model=OLLAMA_MODEL, temperature=0.3, num_predict=2048)
+        return ChatOllama(model=model_key, temperature=0.3, num_predict=2048)
     except Exception as e:
-        st.error(get_text("error_ollama").format(OLLAMA_MODEL))
+        st.error(get_text("error_ollama").format(model_key))
         st.stop()
 
 @st.cache_resource(show_spinner=False)
@@ -200,7 +281,9 @@ def load_embeddings(_device_choice, _embedding_model_key=None):
     device = resolve_device(_device_choice)
     # Get the embedding model key from session state or use default
     model_key = _embedding_model_key or st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
-    model_name = EMBEDDING_MODELS.get(model_key, EMBEDDING_MODELS[DEFAULT_EMBEDDING_MODEL])
+    model_info = EMBEDDING_MODELS.get(model_key, EMBEDDING_MODELS[DEFAULT_EMBEDDING_MODEL])
+    # Extract the actual model name from the dictionary
+    model_name = model_info["model_name"] if isinstance(model_info, dict) else model_info
     try:
         return HuggingFaceEmbeddings(
             model_name=model_name,
@@ -251,10 +334,128 @@ def load_single_pdf(uploaded_file):
     finally:
         os.unlink(tmp_path)
 
-def process_uploaded_files(uploaded_files, progress_bar, status_text):
+def semantic_chunking(pages, embeddings, status_text, threshold=0.5):
+    """
+    Semantic chunking using embeddings - splits documents based on 
+    semantic similarity rather than fixed character counts.
+    """
+    from langchain_core.documents import Document
+    
+    status_text.text("Skapar semantiska segment..." if st.session_state.get("lang","sv")=="sv" else "Creating semantic segments...")
+    
+    # First, split into sentences using basic text splitting
+    sentence_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=300,  # Small chunks for sentence-level analysis
+        chunk_overlap=50,
+        separators=[". ", "! ", "? ", "\n"]
+    )
+    
+    # Get all sentences from all pages
+    all_sentences = []
+    for page in pages:
+        sentences = sentence_splitter.split_text(page.page_content)
+        for sent in sentences:
+            if sent.strip():
+                all_sentences.append({
+                    "text": sent,
+                    "source": page.metadata.get("source", "Unknown"),
+                    "page": page.metadata.get("page", "?")
+                })
+    
+    if not all_sentences:
+        # Fallback to standard chunking
+        splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+        return splitter.split_documents(pages)
+    
+    # Generate embeddings for all sentences
+    status_text.text("Beräknar semantisk likhet..." if st.session_state.get("lang","sv")=="sv" else "Calculating semantic similarity...")
+    
+    # Batch embed for efficiency
+    texts_to_embed = [s["text"] for s in all_sentences]
+    embeddings_matrix = embeddings.embed_documents(texts_to_embed)
+    
+    # Group sentences into chunks based on similarity
+    chunks = []
+    current_chunk_texts = []
+    current_chunk_sources = set()
+    current_chunk_pages = set()
+    
+    for i, sent_info in enumerate(all_sentences):
+        current_chunk_texts.append(sent_info["text"])
+        current_chunk_sources.add(sent_info["source"])
+        current_chunk_pages.add(str(sent_info["page"]))
+        
+        # Check if we should start a new chunk
+        if len(current_chunk_texts) > 1:
+            # Compare with previous sentence
+            prev_embed = embeddings_matrix[i-1]
+            curr_embed = embeddings_matrix[i]
+            
+            # Calculate cosine similarity
+            import numpy as np
+            prev_norm = np.linalg.norm(prev_embed)
+            curr_norm = np.linalg.norm(curr_embed)
+            if prev_norm > 0 and curr_norm > 0:
+                similarity = np.dot(prev_embed, curr_embed) / (prev_norm * curr_norm)
+            else:
+                similarity = 0
+            
+            # If similarity is below threshold, finalize current chunk
+            if similarity < threshold:
+                # Finalize current chunk
+                chunk_text = " ".join(current_chunk_texts)
+                chunks.append(Document(
+                    page_content=chunk_text,
+                    metadata={
+                        "source": ", ".join(current_chunk_sources),
+                        "page": ", ".join(current_chunk_pages)
+                    }
+                ))
+                current_chunk_texts = []
+                current_chunk_sources = set()
+                current_chunk_pages = set()
+    
+    # Don't forget the last chunk
+    if current_chunk_texts:
+        chunk_text = " ".join(current_chunk_texts)
+        chunks.append(Document(
+            page_content=chunk_text,
+            metadata={
+                "source": ", ".join(current_chunk_sources),
+                "page": ", ".join(current_chunk_pages)
+            }
+        ))
+    
+    # If semantic chunking produced too few or too many chunks, adjust
+    # Merge small chunks or split very large ones
+    final_chunks = []
+    min_chunk_size = 200
+    
+    for chunk in chunks:
+        if len(chunk.page_content) < min_chunk_size and final_chunks:
+            # Merge small chunk with previous
+            final_chunks[-1] = Document(
+                page_content=final_chunks[-1].page_content + " " + chunk.page_content,
+                metadata=final_chunks[-1].metadata
+            )
+        elif len(chunk.page_content) > CHUNK_SIZE * 2:
+            # Split large chunks
+            splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+            split_chunks = splitter.split_text(chunk.page_content)
+            for sc in split_chunks:
+                final_chunks.append(Document(page_content=sc, metadata=chunk.metadata))
+        else:
+            final_chunks.append(chunk)
+    
+    return final_chunks
+
+def process_uploaded_files(uploaded_files, progress_bar, status_text, chunking_strategy=None):
     docs = []
     total_files = len(uploaded_files)
     status_text.text(f"{get_text('progress_reading')} (0/{total_files})")
+    
+    # Get chunking strategy from session state or parameter
+    strategy = chunking_strategy or st.session_state.get("chunking_strategy", DEFAULT_CHUNKING)
     
     pages_list = []
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -273,8 +474,23 @@ def process_uploaded_files(uploaded_files, progress_bar, status_text):
         return []
     
     status_text.text(get_text("progress_chunking"))
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    chunks = splitter.split_documents(pages_list)
+    
+    # Use the selected chunking strategy
+    if strategy == "semantic":
+        try:
+            # Load embeddings for semantic chunking
+            embeddings = load_embeddings(st.session_state.device_choice)
+            chunks = semantic_chunking(pages_list, embeddings, status_text)
+        except Exception as e:
+            # Fallback to fixed chunking if semantic fails
+            st.warning(f"Semantisk segmentering misslyckades, använder standard. Fel: {e}" if st.session_state.get("lang","sv")=="sv" else f"Semantic chunking failed, using standard. Error: {e}")
+            splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+            chunks = splitter.split_documents(pages_list)
+    else:
+        # Standard fixed-size chunking
+        splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+        chunks = splitter.split_documents(pages_list)
+    
     return chunks
 
 def build_vectorstore(chunks, embeddings, progress_bar, status_text):
@@ -967,6 +1183,8 @@ def main():
         "last_summary": "",
         "lang": "sv",
         "device_choice": "auto",  # default
+        "llm_model": DEFAULT_LLM_MODEL,  # Quantized model default
+        "chunking_strategy": DEFAULT_CHUNKING,  # Semantic chunking default
         "processing": False,
         "summary_running": False,
         "summary_thread": None,
@@ -1023,13 +1241,60 @@ def main():
         st.divider()
         
         # Embedding model selector (improves semantic understanding)
+        # User-friendly selector with explanations for non-technical users
         st.markdown(f"### {get_text('embedding_model')}")
-        st.caption(get_text("embedding_model_info"))
+        
+        # Create a more user-friendly selector with descriptions
+        def get_embedding_display_text(key):
+            model_info = EMBEDDING_MODELS.get(key, {})
+            if isinstance(model_info, dict):
+                current_lang = st.session_state.get("lang", "sv")
+                display_name = model_info.get(f"display_name_en" if current_lang == "en" else "display_name", key)
+                description = model_info.get(f"description_en" if current_lang == "en" else "description", "")
+                speed = model_info.get("speed", "")
+                quality = model_info.get("quality", "")
+                return f"{display_name}\n{speed} {quality}\n{description}"
+            return key
+        
+        # Get current selection
+        current_embedding = st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
+        
+        # Display radio buttons with detailed explanations for better UX
+        st.markdown("**Välj modell:**" if st.session_state.get("lang", "sv") == "sv" else "**Select model:**")
+        
+        for model_key, model_info in EMBEDDING_MODELS.items():
+            current_lang = st.session_state.get("lang", "sv")
+            display_name = model_info.get(f"display_name_en" if current_lang == "en" else "display_name", model_key)
+            description = model_info.get(f"description_en" if current_lang == "en" else "description", "")
+            speed = model_info.get("speed", "")
+            quality = model_info.get("quality", "")
+            
+            # Create a styled radio option
+            with st.container():
+                col1, col2 = st.columns([1, 5])
+                with col1:
+                    is_selected = st.radio(
+                        "",
+                        options=[model_key],
+                        format_func=lambda x: "●" if x == current_embedding else "○",
+                        key=f"radio_{model_key}",
+                        label_visibility="collapsed"
+                    )
+                with col2:
+                    if model_key == current_embedding:
+                        st.markdown(f"**{display_name}** {speed} {quality}")
+                    else:
+                        st.markdown(f"{display_name} {speed} {quality}")
+                    st.caption(description)
+                st.markdown("---")
+        
+        # Use selectbox for actual selection (hidden style)
         embedding_model = st.selectbox(
             get_text("embedding_model"),
             options=list(EMBEDDING_MODELS.keys()),
-            format_func=lambda x: EMBEDDING_MODELS[x],
+            format_func=get_embedding_display_text,
             key="embedding_model_selector",
+            label_visibility="collapsed",
             index=list(EMBEDDING_MODELS.keys()).index(st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
         )
         if embedding_model != st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL):

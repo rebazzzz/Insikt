@@ -1,48 +1,52 @@
-# TODO: Enhanced RAG Improvements for Insikt App
+# TODO: Performance Optimizations for Insikt App
 
-## Phase 1: Better Embeddings ✅ COMPLETED
+## Phase 1: Quantized Models ✅ COMPLETED
 
-- [x] Upgrade from "all-MiniLM-L6-v2" to "BAAI/bge-base-en-v1.5"
-- [x] Add sidebar setting for embedding model selection (small/base)
-- [x] Update load_embeddings function to support model selection
+- [x] Added LLM_MODELS configuration with multiple model options
+- [x] Added quantized models: llama3.2:3b (fast), llama3.2:1b (turbo)
+- [x] Default set to llama3.2:3b for optimal speed/quality balance
+- [x] User-friendly descriptions with emoji indicators (⚡ speed, ⭐ quality)
+- [x] Updated load_llm to use selected model from session state
 
-## Phase 2: Adaptive Retrieval ✅ COMPLETED
+## Phase 2: Session Caching ✅ COMPLETED
 
-- [x] Create analyze_query_complexity function
-- [x] Implement dynamic k selection based on query complexity
-- [x] Simple queries: k=3-4
-- [x] Medium complexity: k=5-7
-- [x] Complex analytical: k=8-10
+- [x] Document hash-based caching already implemented
+- [x] Summary caching with hash keys
+- [x] Session persistence to disk (FAISS vectorstore + pickle)
+- [x] Cached summaries retrieved automatically
 
-## Phase 3: Citation Verification ✅ COMPLETED
+## Phase 3: Semantic Chunking ✅ COMPLETED
 
-- [x] Create verify_citations function
-- [x] Extract citations from generated response
-- [x] Verify cited sources exist in retrieved context
-- [x] Add verification step in chat_with_docs
-- [x] Option to regenerate if citations are invalid
+- [x] Implemented semantic_chunking function using embeddings
+- [x] Uses cosine similarity to group semantically related sentences
+- [x] Default strategy set to "semantic" for better accuracy
+- [x] Fallback to fixed-size chunking if semantic fails
+- [x] Merges small chunks and splits large ones for optimal size
 
-## Summary of Changes:
+## Additional Updates:
 
-### 4. Better Embeddings:
+- [x] Added numpy to requirements.txt for similarity calculations
+- [x] Added llm_model and chunking_strategy to session state defaults
+- [x] All optimizations work automatically with smart defaults
+- [x] Non-tech friendly descriptions throughout
 
-- Upgraded to "BAAI/bge-base-en-v1.5" for better quality
-- Added user-selectable model in sidebar (bge-small/bge-base options)
-- Better semantic understanding and retrieval accuracy
-- Session state preserves user choice
+## Implementation Summary:
 
-### 5. Adaptive Retrieval:
+### 7. Quantized Models:
 
-- Query complexity analysis based on:
-  - Query length (word count)
-  - Analytical keywords (compare, analyze, explain, why, how)
-  - Multiple entities/concepts
-  - Comparison indicators
-- Dynamic k selection: k=3 (simple), k=5 (medium), k=8 (complex)
+- Default: llama3.2:3b (fast, good quality, medium memory)
+- Options: llama3.2:1b (turbo, fastest, lowest memory), llama3.2 (standard, best quality)
+- All models pre-configured with user-friendly descriptions
 
-### 6. Citation Verification:
+### 8. Session Caching:
 
-- Extracts citations from response (handles both Swedish and English formats)
-- Verifies citations exist in retrieved context
-- Adds warning if citations cannot be verified
-- Returns verified response with any warnings
+- Hash-based document caching for summaries
+- FAISS vectorstore persisted to disk
+- Session data saved/loaded with all settings
+
+### 9. Semantic Chunking:
+
+- Uses embeddings to find semantically similar sentences
+- Groups sentences based on cosine similarity threshold (0.5)
+- Better for maintaining context in documents
+- Falls back to fixed-size if semantic fails

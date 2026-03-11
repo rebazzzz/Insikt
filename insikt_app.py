@@ -189,6 +189,15 @@ LANGUAGES = {
         "error_pdf_corrupt": "En eller flera PDF-filer är skadade eller oläsbara.",
         "embedding_model": "Inbäddningsmodell",
         "embedding_model_info": "BGE-modeller ger bättre semantisk förståelse än MiniLM",
+        # Document processing progress messages
+        "progress_reading": "Läser dokument",
+        "progress_chunking": "Delar upp i segment",
+        "progress_indexing": "Bygger kunskapsbas",
+        "progress_embedding": "Skapar semantiska vektorer",
+        "progress_complete": "Klart!",
+        "stage_reading": "Läser dokument {} av {}",
+        "stage_chunking": "Delar upp dokument i {} segment",
+        "stage_embedding": "Skapar vektorer för {} segment",
     },
     "en": {
         "title": "Insikt – Journalist AI",
@@ -241,6 +250,15 @@ LANGUAGES = {
         "error_pdf_corrupt": "One or more PDF files are corrupted or unreadable.",
         "embedding_model": "Embedding Model",
         "embedding_model_info": "BGE models provide better semantic understanding than MiniLM",
+        # Document processing progress messages
+        "progress_reading": "Reading documents",
+        "progress_chunking": "Chunking documents",
+        "progress_indexing": "Building knowledge base",
+        "progress_embedding": "Creating semantic vectors",
+        "progress_complete": "Complete!",
+        "stage_reading": "Reading document {} of {}",
+        "stage_chunking": "Chunking into {} segments",
+        "stage_embedding": "Creating vectors for {} segments",
     }
 }
 
@@ -605,8 +623,10 @@ Final summary:"""
             total_batches = len(batches)
             
             for batch_idx, batch in enumerate(batches):
+                # Calculate percentage based on batch progress
+                percentage = int((batch_idx + 1) / total_batches * 100)
                 if self.progress_callback:
-                    self.progress_callback("processing", batch_idx + 1, total_batches, 
+                    self.progress_callback("processing", batch_idx + 1, total_batches, percentage,
                         f"Sammanfattar avsnitt {batch_idx + 1} av {total_batches}..." if self.lang == "sv" else 
                         f"Summarizing section {batch_idx + 1} of {total_batches}...")
                 
@@ -693,13 +713,33 @@ def start_summary(docs, target_pages, focus, style, words_per_page, lang):
 
 def update_summary_progress(stage, current, total, percentage, message):
     """Enhanced progress callback with detailed stage information."""
-    st.session_state.summary_stage = stage
-    st.session_state.summary_current_batch = current
-    st.session_state.summary_total_batches = total
-    st.session_state.summary_percentage = percentage
+    # Initialize session state variables if they don't exist (for background thread safety)
+    if "summary_stage" not in st.session_state:
+        st.session_state.summary_stage = stage
+    else:
+        st.session_state.summary_stage = stage
+    
+    if "summary_current_batch" not in st.session_state:
+        st.session_state.summary_current_batch = current
+    else:
+        st.session_state.summary_current_batch = current
+        
+    if "summary_total_batches" not in st.session_state:
+        st.session_state.summary_total_batches = total
+    else:
+        st.session_state.summary_total_batches = total
+        
+    if "summary_percentage" not in st.session_state:
+        st.session_state.summary_percentage = percentage
+    else:
+        st.session_state.summary_percentage = percentage
     
     # Add to log if message changed
     if message:
+        # Initialize log if it doesn't exist
+        if "summary_stages_log" not in st.session_state:
+            st.session_state.summary_stages_log = []
+            
         log_entry = {
             "stage": stage,
             "message": message,
@@ -709,9 +749,9 @@ def update_summary_progress(stage, current, total, percentage, message):
         if not st.session_state.summary_stages_log or st.session_state.summary_stages_log[-1]["message"] != message:
             st.session_state.summary_stages_log.append(log_entry)
     
-    # Keep log manageable - max 50 entries
-    if len(st.session_state.summary_stages_log) > 50:
-        st.session_state.summary_stages_log = st.session_state.summary_stages_log[-50:]
+        # Keep log manageable - max 50 entries
+        if len(st.session_state.summary_stages_log) > 50:
+            st.session_state.summary_stages_log = st.session_state.summary_stages_log[-50:]
 
 def check_summary_status():
     if st.session_state.get("summary_running", False):
@@ -1353,7 +1393,7 @@ def main():
                     st.success(get_text("success_docs").format(len(uploaded_files), len(chunks)))
 
                     progress.progress(0)
-                    # Load embeddings with current device choice
+                    status.text(get_text("progress_indexing"))
                     embeddings = load_embeddings(st.session_state.device_choice)
                     vs = build_vectorstore(chunks, embeddings, progress, status)
                     if vs:

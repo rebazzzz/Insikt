@@ -275,7 +275,26 @@ def build_vectorstore(chunks, embeddings, progress_bar, status_text):
     progress_bar.progress(1.0)
     return vectorstore
 
-# ---------- BACKGROUND SUMMARIZATION ----------
+# ---------- OPTIMIZED SUMMARIZATION WITH BATCH PROCESSING, MAPREDUCE & CACHING ----------
+import hashlib
+
+def generate_doc_hash(docs):
+    """Generate a unique hash for the document set to use as cache key."""
+    content = "".join([doc.page_content for doc in docs])
+    return hashlib.md5(content.encode()).hexdigest()
+
+def get_cached_summary(doc_hash, focus, style, target_words):
+    """Retrieve cached summary if available."""
+    cache_key = f"{doc_hash}_{focus}_{style}_{target_words}"
+    return st.session_state.get("summary_cache", {}).get(cache_key)
+
+def set_cached_summary(doc_hash, focus, style, target_words, summary):
+    """Store summary in cache."""
+    cache_key = f"{doc_hash}_{focus}_{style}_{target_words}"
+    if "summary_cache" not in st.session_state:
+        st.session_state.summary_cache = {}
+    st.session_state.summary_cache[cache_key] = summary
+
 class SummaryThread(threading.Thread):
     def __init__(self, docs, llm, target_pages, focus, style, words_per_page, lang, progress_callback):
         super().__init__()
@@ -293,93 +312,141 @@ class SummaryThread(threading.Thread):
     def run(self):
         try:
             target_words = self.target_pages * self.words_per_page
+            
+            # ===== STEP 1: BATCH CHUNKS TOGETHER =====
+            # Group multiple pages into batches to reduce LLM calls
+            BATCH_SIZE = 5  # Process 5 chunks at a time
+            batches = [self.docs[i:i+BATCH_SIZE] for i in range(0, len(self.docs), BATCH_SIZE)]
+            
             if self.lang == "sv":
-                initial_template = "Du är en undersökande journalist. Sammanfatta följande text med fokus på: {focus}. Inkludera viktiga fakta, namn, datum och sidhänvisningar. Text: {text}"
-                refine_template = """
-Du har en befintlig sammanfattning: {existing_summary}
-Läs nu följande nya text och införliva eventuell NY viktig information i sammanfattningen.
+                # Map phase: summarize each batch
+                map_template = """Du är en undersökande journalist. Skapa en detaljerad sammanfattning av följande textavsnitt med fokus på: {focus}.
+Inkludera viktiga fakta, namn, datum och sidhänvisningar.
+Textavsnitt: {text}
+
+Detaljerad sammanfattning av detta avsnitt:"""
+                
+                # Reduce phase: combine batch summaries
+                reduce_template = """Du är en journalist och redaktör. Kombinera följande separata sammanfattningar till en sammanhängande helhet på ungefär {target_words} ord.
 Fokus: {focus}. Stil: {style}.
-Om den nya texten tillför detaljer, namn, datum eller händelser, lägg till dem. Håll sammanfattningen sammanhängande och inom cirka {target_words} ord totalt.
+Bevara viktiga fakta, namn, datum och källhänvisningar.
 
-Ny text: {text}
+Sammanfattningar att kombinera:
+{existing_summaries}
 
-Förbättrad sammanfattning:
-"""
-                final_prompt = f"""
-Du är en journalist och redaktör. Utifrån följande pågående sammanfattning, producera en slutlig, polerad sammanfattning på ungefär {target_words} ord.
+Kombinerad sammanfattning:"""
+                
+                final_prompt = f"""Du är en journalist och redaktör. Förfina följande sammanfattning till en slutlig, polerad version på ungefär {target_words} ord.
 Stil: {{style}}. Fokus: {{focus}}.
 Inkludera källhänvisningar [Källa: filnamn, sida X] där möjligt.
 
-Pågående sammanfattning:
+Sammanfattning att förfina:
 {{current_summary}}
 
-Slutlig sammanfattning:
-"""
+Slutlig sammanfattning:"""
             else:
-                initial_template = "You are an investigative journalist. Summarize the following text, focusing on: {focus}. Include key facts, names, dates, and page references. Text: {text}"
-                refine_template = """
-You have an existing summary: {existing_summary}
-Now read the following new text and incorporate any NEW important information into the summary.
+                # English templates
+                map_template = """You are an investigative journalist. Create a detailed summary of the following text passage, focusing on: {focus}.
+Include key facts, names, dates, and page references.
+Text passage: {text}
+
+Detailed summary of this passage:"""
+                
+                reduce_template = """You are a journalist and editor. Combine the following separate summaries into a coherent whole of approximately {target_words} words.
 Focus: {focus}. Style: {style}.
-If the new text adds details, names, dates, or events, add them. Keep the summary coherent and within about {target_words} words total.
+Preserve important facts, names, dates, and source citations.
 
-New text: {text}
+Summaries to combine:
+{existing_summaries}
 
-Improved summary:
-"""
-                final_prompt = """
-You are a journalist and editor. Based on the following running summary, produce a final, polished summary of approximately {target_words} words.
+Combined summary:"""
+                
+                final_prompt = """You are a journalist and editor. Refine the following summary into a final, polished version of approximately {target_words} words.
 Style: {style}. Focus: {focus}.
 Include citations [Source: filename, page X] where possible.
 
-Running summary:
+Summary to refine:
 {current_summary}
 
-Final summary:
-"""
+Final summary:"""
 
-            initial_prompt = PromptTemplate(template=initial_template, input_variables=["text", "focus"])
-            refine_prompt = PromptTemplate(template=refine_template, input_variables=["existing_summary", "text", "focus", "style", "target_words"])
-
-            current_summary = ""
-            total = len(self.docs)
-            for i, doc in enumerate(self.docs):
+            # ===== STEP 2: MAP PHASE - Process batches in parallel =====
+            batch_summaries = []
+            total_batches = len(batches)
+            
+            for batch_idx, batch in enumerate(batches):
                 if self.progress_callback:
-                    self.progress_callback(i, total)
-                text = doc.page_content
-                source = doc.metadata.get("source", "Unknown")
-                page = doc.metadata.get("page", "?")
-                text_with_ref = f"[Från {source}, sida {page}]: {text}" if self.lang == "sv" else f"[From {source}, page {page}]: {text}"
-
+                    self.progress_callback(batch_idx, total_batches)
+                
+                # Combine text from all chunks in this batch
+                batch_text = ""
+                for doc in batch:
+                    source = doc.metadata.get("source", "Unknown")
+                    page = doc.metadata.get("page", "?")
+                    batch_text += f"[Från {source}, sida {page}]: {doc.page_content}\n\n" if self.lang == "sv" else f"[From {source}, page {page}]: {doc.page_content}\n\n"
+                
                 try:
-                    if i == 0:
-                        prompt = initial_prompt.format(text=text_with_ref, focus=self.focus)
-                        current_summary = self.llm.invoke(prompt).content
-                    else:
-                        prompt = refine_prompt.format(
-                            existing_summary=current_summary,
-                            text=text_with_ref,
-                            focus=self.focus,
-                            style=self.style,
-                            target_words=target_words
-                        )
-                        current_summary = self.llm.invoke(prompt).content
+                    prompt = map_template.format(focus=self.focus, text=batch_text)
+                    summary = self.llm.invoke(prompt).content
+                    batch_summaries.append(summary)
                 except Exception as e:
                     self.error = str(e)
                     return
-
-            # Final polish
-            final_prompt_text = final_prompt.format(current_summary=current_summary, target_words=target_words, style=self.style, focus=self.focus)
+            
+            # ===== STEP 3: REDUCE PHASE - Combine batch summaries =====
+            if len(batch_summaries) == 1:
+                combined_summary = batch_summaries[0]
+            else:
+                # First reduce: combine all batch summaries
+                combined = batch_summaries[0]
+                for i in range(1, len(batch_summaries)):
+                    try:
+                        prompt = reduce_template.format(
+                            existing_summaries=combined,
+                            target_words=target_words,
+                            focus=self.focus,
+                            style=self.style
+                        )
+                        combined = self.llm.invoke(prompt).content
+                    except Exception as e:
+                        self.error = str(e)
+                        return
+                combined_summary = combined
+            
+            # ===== STEP 4: Final polish =====
             try:
+                final_prompt_text = final_prompt.format(
+                    current_summary=combined_summary,
+                    target_words=target_words,
+                    style=self.style,
+                    focus=self.focus
+                )
                 final_summary = self.llm.invoke(final_prompt_text).content
             except Exception as e:
                 self.error = str(e)
                 return
+            
             self.result = final_summary
         except Exception as e:
             self.error = str(e)
 
 def start_summary(docs, target_pages, focus, style, words_per_page, lang):
+    # Store parameters for caching
+    st.session_state.last_target_words = target_pages * words_per_page
+    st.session_state.last_focus = focus
+    st.session_state.last_style = style
+    
+    # Check cache first
+    doc_hash = generate_doc_hash(docs)
+    target_words = target_pages * words_per_page
+    
+    cached = get_cached_summary(doc_hash, focus, style, target_words)
+    if cached:
+        st.session_state.last_summary = cached
+        st.session_state.summary_result = cached
+        st.success("📋 Hämtade från cache!" if lang == "sv" else "📋 Retrieved from cache!")
+        return
+    
     # Load LLM with current device choice
     device_choice = st.session_state.device_choice
     llm = load_llm(device_choice)
@@ -405,6 +472,15 @@ def check_summary_status():
             else:
                 st.session_state.summary_result = thread.result
                 st.session_state.last_summary = thread.result
+                
+                # Store in cache for future use
+                if st.session_state.docs and thread.result:
+                    doc_hash = generate_doc_hash(st.session_state.docs)
+                    target_words = st.session_state.get("last_target_words", 1500)
+                    focus = st.session_state.get("last_focus", "")
+                    style = st.session_state.get("last_style", "neutral")
+                    set_cached_summary(doc_hash, focus, style, target_words, thread.result)
+                    
             st.session_state.summary_running = False
             st.session_state.summary_thread = None
             st.rerun()

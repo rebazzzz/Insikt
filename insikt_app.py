@@ -606,7 +606,9 @@ Final summary:"""
             
             for batch_idx, batch in enumerate(batches):
                 if self.progress_callback:
-                    self.progress_callback(batch_idx, total_batches)
+                    self.progress_callback("processing", batch_idx + 1, total_batches, 
+                        f"Sammanfattar avsnitt {batch_idx + 1} av {total_batches}..." if self.lang == "sv" else 
+                        f"Summarizing section {batch_idx + 1} of {total_batches}...")
                 
                 # Combine text from all chunks in this batch
                 batch_text = ""
@@ -1560,7 +1562,7 @@ def main():
             
             # Show current batch info if processing
             if stage == "processing" and total_batches > 0:
-                st.caption(f"{lang=='sv' ? 'Batch' : 'Batch'} {current_batch} / {total_batches}")
+                st.caption(f"{'Batch' if lang=='sv' else 'Batch'} {current_batch} / {total_batches}")
             
             # Expandable log
             with st.expander("📋 " + ("Detaljerad logg" if lang=="sv" else "Detailed Log")):

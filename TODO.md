@@ -39,8 +39,14 @@
 
 ### Stage Messages (Bilingual):
 
-- "Initierar" / "Initializing"
-- "Sammanfattar avsnitt X av Y" / "Summarizing section X of Y"
-- "Kombinerar sammanfattning X av Y" / "Combining summary X of Y"
-- "Färdigställer" / "Finalizing"
+- "Initierar sammanfattningsprocess..." / "Initializing summarization process..."
+- "Sammanfattar avsnitt X av Y..." / "Summarizing section X of Y..."
+- "Kombinerar sammanfattning X av Y..." / "Combining summary X of Y..."
+- "Färdigställer slutlig sammanfattning..." / "Finalizing summary..."
 - "Slutfört! Sammanfattning genererad på Xs" / "Complete! Summary generated in Xs"
+
+## Notes:
+
+- The SummaryThread now has proper indentation and is fully functional
+- The progress callback is being called with detailed stage information
+- The UI properly displays all progress stages with icons and percentage

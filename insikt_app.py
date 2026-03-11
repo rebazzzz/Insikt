@@ -689,9 +689,27 @@ def start_summary(docs, target_pages, focus, style, words_per_page, lang):
     st.session_state.summary_error = None
     thread.start()
 
-def update_summary_progress(current, total):
-    st.session_state.summary_progress = current + 1
-    st.session_state.summary_total = total
+def update_summary_progress(stage, current, total, percentage, message):
+    """Enhanced progress callback with detailed stage information."""
+    st.session_state.summary_stage = stage
+    st.session_state.summary_current_batch = current
+    st.session_state.summary_total_batches = total
+    st.session_state.summary_percentage = percentage
+    
+    # Add to log if message changed
+    if message:
+        log_entry = {
+            "stage": stage,
+            "message": message,
+            "timestamp": time.time(),
+            "percentage": percentage
+        }
+        if not st.session_state.summary_stages_log or st.session_state.summary_stages_log[-1]["message"] != message:
+            st.session_state.summary_stages_log.append(log_entry)
+    
+    # Keep log manageable - max 50 entries
+    if len(st.session_state.summary_stages_log) > 50:
+        st.session_state.summary_stages_log = st.session_state.summary_stages_log[-50:]
 
 def check_summary_status():
     if st.session_state.get("summary_running", False):
@@ -1192,6 +1210,15 @@ def main():
         "summary_total": 0,
         "summary_result": None,
         "summary_error": None,
+        # New UX improvements - detailed progress tracking
+        "summary_stage": "idle",  # idle, reading, processing, combining, polishing, complete, error, cancelled
+        "summary_stages_log": [],  # List of all stage changes with timestamps
+        "summary_current_batch": 0,
+        "summary_total_batches": 0,
+        "summary_percentage": 0,
+        "summary_cancel_requested": False,
+        "summary_start_time": None,
+        "summary_stage_duration": 0,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -1472,19 +1499,118 @@ def main():
         st.markdown("Generera en omfattande sammanfattning av dina dokument. Inställningar finns i sidofältet." if lang=="sv" else "Generate a comprehensive summary of your documents. Settings are in the sidebar.")
         
         if st.session_state.summary_running:
-            st.markdown(f'<div class="info-box">{get_text("summarizing")} {st.session_state.summary_progress}/{st.session_state.summary_total}</div>', unsafe_allow_html=True)
-            st.progress(st.session_state.summary_progress / st.session_state.summary_total)
+            # Enhanced progress UI with detailed stages
+            stage = st.session_state.get("summary_stage", "processing")
+            percentage = st.session_state.get("summary_percentage", 0)
+            current_batch = st.session_state.get("summary_current_batch", 0)
+            total_batches = st.session_state.get("summary_total_batches", 0)
+            
+            # Stage indicator pills
+            stage_icons = {
+                "idle": "⚪",
+                "initializing": "🔄",
+                "processing": "📝",
+                "combining": "🔗",
+                "polishing": "✨",
+                "complete": "✅",
+                "error": "❌",
+                "cancelled": "⏹️"
+            }
+            current_icon = stage_icons.get(stage, "⏳")
+            
+            # Stage labels
+            stage_labels = {
+                "idle": "Väntar" if lang=="sv" else "Idle",
+                "initializing": "Initierar" if lang=="sv" else "Initializing",
+                "processing": "Sammanfattar avsnitt" if lang=="sv" else "Processing sections",
+                "combining": "Kombinerar sammanfattningar" if lang=="sv" else "Combining summaries",
+                "polishing": "Färdigställer" if lang=="sv" else "Finalizing",
+                "complete": "Klart" if lang=="sv" else "Complete",
+                "error": "Fel" if lang=="sv" else "Error",
+                "cancelled": "Avbrutet" if lang=="sv" else "Cancelled"
+            }
+            
+            # Show current stage with icon
+            st.markdown(f"""
+            <div class="info-box">
+                <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
+                    <span style="font-size: 24px;">{current_icon}</span>
+                    <span style="font-weight: 600; font-size: 16px;">{stage_labels.get(stage, stage)}</span>
+                    <span style="margin-left: auto; font-weight: bold; color: #3b82f6;">{percentage:.0f}%</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Overall progress bar
+            st.progress(percentage / 100.0)
+            
+            # Stage progress indicators (showing all stages)
+            cols = st.columns(4)
+            stages_order = ["processing", "combining", "polishing", "complete"]
+            for i, s in enumerate(stages_order):
+                with cols[i]:
+                    is_active = (stage == s)
+                    is_complete = (stages_order.index(stage) > i) if stage in stages_order else False
+                    if is_complete:
+                        st.markdown(f"✅ **{stage_labels.get(s, s)}**")
+                    elif is_active:
+                        st.markdown(f"🔄 **{stage_labels.get(s, s)}**")
+                    else:
+                        st.markdown(f"⚪ {stage_labels.get(s, s)}")
+            
+            # Show current batch info if processing
+            if stage == "processing" and total_batches > 0:
+                st.caption(f"{lang=='sv' ? 'Batch' : 'Batch'} {current_batch} / {total_batches}")
+            
+            # Expandable log
+            with st.expander("📋 " + ("Detaljerad logg" if lang=="sv" else "Detailed Log")):
+                log = st.session_state.get("summary_stages_log", [])
+                for entry in log[-10:]:  # Show last 10 entries
+                    st.caption(f"{entry.get('percentage', 0):.0f}% - {entry.get('message', '')}")
+            
+            # Cancel button
+            col1, col2 = st.columns([1, 4])
+            with col1:
+                if st.button("⏹️ " + ("Avbryt" if lang=="sv" else "Cancel"), key="cancel_summary"):
+                    st.session_state.summary_cancel_requested = True
+                    if st.session_state.get("summary_thread"):
+                        st.session_state.summary_thread.stop()
+                    st.session_state.summary_running = False
+                    st.session_state.summary_stage = "cancelled"
+                    st.rerun()
+                    
         elif st.session_state.summary_error:
-            st.markdown(f'<div class="warning-box">Fel: {st.session_state.summary_error}</div>', unsafe_allow_html=True)
+            error_msg = st.session_state.summary_error
+            if error_msg == "cancelled":
+                st.markdown(f'<div class="warning-box">⚠️ {"Åtgärden avbröts av användaren." if lang=="sv" else "Operation cancelled by user."}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="warning-box">❌ {"Fel: " if lang=="sv" else "Error: "}{error_msg}</div>', unsafe_allow_html=True)
         elif st.session_state.summary_result:
             st.markdown("### " + ("Sammanfattning" if lang=="sv" else "Summary"))
             st.write(st.session_state.summary_result)
             st.session_state.last_summary = st.session_state.summary_result
+            # Show success message with duration if available
+            if st.session_state.get("summary_stages_log"):
+                # Find completion entry
+                for entry in reversed(st.session_state.summary_stages_log):
+                    if "complete" in entry.get("message", "").lower() or "slutfört" in entry.get("message", "").lower():
+                        st.success(entry.get("message", get_text("success_summary")))
+                        break
+                else:
+                    st.success(get_text("success_summary"))
 
+        # Generate button
         if st.button(get_text("summarize_btn"), disabled=st.session_state.processing or st.session_state.summary_running or not st.session_state.docs, key="summarize_btn_main"):
             if not st.session_state.docs:
                 st.error(get_text("error_no_docs"))
             else:
+                # Reset progress state before starting
+                st.session_state.summary_stage = "initializing"
+                st.session_state.summary_stages_log = []
+                st.session_state.summary_percentage = 0
+                st.session_state.summary_current_batch = 0
+                st.session_state.summary_total_batches = 0
+                st.session_state.summary_cancel_requested = False
                 start_summary(st.session_state.docs, target_pages, focus, style, words_per_page, st.session_state.lang)
                 st.rerun()
 

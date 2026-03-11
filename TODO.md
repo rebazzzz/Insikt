@@ -1,52 +1,46 @@
-# TODO: Performance Optimizations for Insikt App
+# TODO: UX Improvements for Summarization Progress
 
-## Phase 1: Quantized Models ✅ COMPLETED
+## Phase 1: Enhanced Progress Tracking ✅ COMPLETED
 
-- [x] Added LLM_MODELS configuration with multiple model options
-- [x] Added quantized models: llama3.2:3b (fast), llama3.2:1b (turbo)
-- [x] Default set to llama3.2:3b for optimal speed/quality balance
-- [x] User-friendly descriptions with emoji indicators (⚡ speed, ⭐ quality)
-- [x] Updated load_llm to use selected model from session state
+- [x] 1. Add detailed stage constants (reading, processing, combining, polishing)
+- [x] 2. Add session state variables for stage tracking
+- [x] 3. Modify SummaryThread to track detailed stages
+- [x] 4. Add progress callback with stage information
 
-## Phase 2: Session Caching ✅ COMPLETED
+## Phase 2: UI Improvements ✅ COMPLETED
 
-- [x] Document hash-based caching already implemented
-- [x] Summary caching with hash keys
-- [x] Session persistence to disk (FAISS vectorstore + pickle)
-- [x] Cached summaries retrieved automatically
-
-## Phase 3: Semantic Chunking ✅ COMPLETED
-
-- [x] Implemented semantic_chunking function using embeddings
-- [x] Uses cosine similarity to group semantically related sentences
-- [x] Default strategy set to "semantic" for better accuracy
-- [x] Fallback to fixed-size chunking if semantic fails
-- [x] Merges small chunks and splits large ones for optimal size
-
-## Additional Updates:
-
-- [x] Added numpy to requirements.txt for similarity calculations
-- [x] Added llm_model and chunking_strategy to session state defaults
-- [x] All optimizations work automatically with smart defaults
-- [x] Non-tech friendly descriptions throughout
+- [x] 5. Create detailed stage progress bar (multiple indicators)
+- [x] 6. Add expandable status log container
+- [x] 7. Show percentage completion and stage description
+- [x] 8. Add cancel button for long-running operations
+- [x] 9. Clear success/error states with helpful messages
+- [x] 10. Better processing messages throughout
 
 ## Implementation Summary:
 
-### 7. Quantized Models:
+### New Session State Variables:
 
-- Default: llama3.2:3b (fast, good quality, medium memory)
-- Options: llama3.2:1b (turbo, fastest, lowest memory), llama3.2 (standard, best quality)
-- All models pre-configured with user-friendly descriptions
+- `summary_stage` - Current stage (idle, initializing, processing, combining, polishing, complete, error, cancelled)
+- `summary_stages_log` - List of all stage changes with timestamps
+- `summary_current_batch` - Current batch being processed
+- `summary_total_batches` - Total number of batches
+- `summary_percentage` - Overall percentage complete
+- `summary_cancel_requested` - Flag for cancel request
 
-### 8. Session Caching:
+### Enhanced UI Features:
 
-- Hash-based document caching for summaries
-- FAISS vectorstore persisted to disk
-- Session data saved/loaded with all settings
+- Stage indicator pills showing current stage with icons (⚪🔄📝🔗✨✅❌⏹️)
+- 4-column stage progress showing all stages (Processing → Combining → Polishing → Complete)
+- Expandable detailed log showing last 10 progress entries
+- Overall percentage display with progress bar
+- Cancel button to stop long-running operations
+- Clear error/cancelled states with helpful messages
+- Success messages showing completion time
 
-### 9. Semantic Chunking:
+### Stage Messages (Bilingual):
 
-- Uses embeddings to find semantically similar sentences
-- Groups sentences based on cosine similarity threshold (0.5)
-- Better for maintaining context in documents
-- Falls back to fixed-size if semantic fails
+- "Initierar" / "Initializing"
+- "Sammanfattar avsnitt X av Y" / "Summarizing section X of Y"
+- "Kombinerar sammanfattning X av Y" / "Combining summary X of Y"
+- "Färdigställer" / "Finalizing"
+- "Slutfört! Sammanfattning genererad på Xs" / "Complete! Summary generated in Xs"

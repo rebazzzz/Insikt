@@ -1303,7 +1303,7 @@ def main():
                 col1, col2 = st.columns([1, 5])
                 with col1:
                     is_selected = st.radio(
-                        "",
+                        "select_embedding_model",
                         options=[model_key],
                         format_func=lambda x: "●" if x == current_embedding else "○",
                         key=f"radio_{model_key}",

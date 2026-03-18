@@ -155,6 +155,9 @@ WRITING_TONES = {
     "investigative": {"sv": "Granskande", "en": "Investigative"},
     "narrative": {"sv": "Berattande", "en": "Narrative"},
     "formal": {"sv": "Formell", "en": "Formal"},
+    "literary": {"sv": "Litterar", "en": "Literary"},
+    "poetic": {"sv": "Poetisk", "en": "Poetic"},
+    "immersive": {"sv": "Narmvar", "en": "Immersive"},
 }
 WRITING_LENGTHS = {
     "short": {"sv": "Kort", "en": "Short", "words": 400},
@@ -239,6 +242,8 @@ LANGUAGES = {
         "writing_result": "Utkast",
         "writing_help": "Anvand dokumenten som faktabas nar det gar.",
         "writing_sources": "Kallor anvanda",
+        "writing_pipeline": "Dokumentar-pipeline",
+        "writing_pipeline_help": "Skapa en disposition, scenlista och slutligt manus i tre steg.",
         # Document processing progress messages
         "progress_reading": "LÃ¤ser dokument",
         "progress_chunking": "Delar upp i segment",
@@ -325,6 +330,8 @@ LANGUAGES = {
         "writing_result": "Draft",
         "writing_help": "Use documents as a factual base whenever possible.",
         "writing_sources": "Sources used",
+        "writing_pipeline": "Documentary pipeline",
+        "writing_pipeline_help": "Generate outline, scene list, and final script in three steps.",
         # Document processing progress messages
         "progress_reading": "Reading documents",
         "progress_chunking": "Chunking documents",
@@ -870,6 +877,14 @@ Final summary:"""
                 self.result = final_summary
             else:
                 self.result = combined_summary
+
+            # Stricter citation verification for summaries
+            if self.docs and not _has_citations(self.result, self.lang):
+                sources_list = _build_sources_list(self.docs, self.lang)
+                self.result = _citation_fix(self.result, self.lang, llm, sources_list)
+                if not _has_citations(self.result, self.lang):
+                    warning = "\n\nOBS: Kallor kunde inte verifieras." if self.lang == "sv" else "\n\nNote: Citations could not be verified."
+                    self.result += warning
         except Exception as e:
             self.error = str(e)
 
@@ -1104,13 +1119,80 @@ Deliver:
 
     return prompt
 
-def generate_writing(brief, role_key, format_key, tone_key, length_key, lang, vectorstore, llm, use_sources=True):
+def _has_citations(text, lang):
+    if lang == "sv":
+        return bool(re.search(r"\[Kalla:\s*[^\]]+\]", text))
+    return bool(re.search(r"\[Source:\s*[^\]]+\]", text))
+
+
+def _citation_fix(text, lang, llm, sources_list):
+    if not sources_list:
+        return text
+    if lang == "sv":
+        prompt = f"""Du ar en redaktor. Lagg till tydliga kallhanvisningar i texten.
+Anvand endast denna lista over kallor:
+{sources_list}
+
+Text:
+{text}
+
+Uppdaterad text med kallor:"""
+    else:
+        prompt = f"""You are an editor. Add clear citations to the text.
+Use only this list of sources:
+{sources_list}
+
+Text:
+{text}
+
+Updated text with citations:"""
+    try:
+        return llm.invoke(prompt).content
+    except Exception:
+        return text
+
+
+def _build_sources_list(docs, lang, limit=15):
+    if not docs:
+        return ""
+    items = []
+    seen = set()
+    for doc in docs:
+        src = doc.metadata.get("source", "Unknown")
+        page = doc.metadata.get("page", "?")
+        key = f"{src}:{page}"
+        if key in seen:
+            continue
+        seen.add(key)
+        label = f"{src}, sida {page}" if lang == "sv" else f"{src}, page {page}"
+        items.append(label)
+        if len(items) >= limit:
+            break
+    return "\n".join(items)
+
+def generate_writing(brief, role_key, format_key, tone_key, length_key, lang, vectorstore, llm, use_sources=True, use_pipeline=False):
     context_docs = retrieve_context(brief, vectorstore, k=6) if vectorstore and use_sources else []
     prompt = create_writing_prompt(brief, role_key, format_key, tone_key, length_key, lang, context_docs)
+    sources_list = _build_sources_list(context_docs, lang)
     try:
-        response = llm.invoke(prompt).content
+        if use_pipeline and format_key == "documentary":
+            outline_prompt = prompt + ("\n\nSteg 1: Skapa en tydlig disposition." if lang == "sv" else "\n\nStep 1: Create a clear outline.")
+            outline = llm.invoke(outline_prompt).content
+            scene_prompt = ("\n\nSteg 2: Skapa en scenlista baserat pa dispositionen:\n" if lang == "sv" else "\n\nStep 2: Create a scene list based on the outline:\n") + outline
+            scenes = llm.invoke(scene_prompt).content
+            script_prompt = ("\n\nSteg 3: Skriv slutligt manus baserat pa scenlistan:\n" if lang == "sv" else "\n\nStep 3: Write the final script based on the scene list:\n") + scenes
+            response = llm.invoke(script_prompt).content
+            response = f"{outline}\n\n{scenes}\n\n{response}"
+        else:
+            response = llm.invoke(prompt).content
     except Exception as e:
         response = f"Fel vid generering: {e}" if lang == "sv" else f"Error generating text: {e}"
+
+    if use_sources and context_docs and not _has_citations(response, lang):
+        response = _citation_fix(response, lang, llm, sources_list)
+        if not _has_citations(response, lang):
+            warning = "\n\nOBS: Kallor kunde inte verifieras." if lang == "sv" else "\n\nNote: Citations could not be verified."
+            response += warning
     return response, context_docs
 
 
@@ -1584,6 +1666,7 @@ def main():
         "writing_tone": "investigative",
         "writing_length": "medium",
         "writing_use_sources": True,
+        "writing_pipeline": False,
         "writing_result": "",
         "writing_sources": [],
     }
@@ -1598,7 +1681,7 @@ def main():
     with st.sidebar:
         st.markdown(f"## {get_text('title')}")
         current_device = resolve_device(st.session_state.device_choice)
-        st.caption(f"Kors pa **{current_device.upper()}**")
+        st.caption(f"Körs på **{current_device.upper()}**" if st.session_state.lang == "sv" else f"Running on **{current_device.upper()}**")
         st.divider()
 
         # Language selector
@@ -1688,34 +1771,6 @@ def main():
                 quality = model_info.get("quality", "")
                 return f"{display_name}\\n{speed} {quality}\\n{description}"
             return key
-
-        current_embedding = st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
-        st.markdown("**Valj modell:**" if st.session_state.get("lang", "sv") == "sv" else "**Select model:**")
-
-        for model_key, model_info in EMBEDDING_MODELS.items():
-            current_lang = st.session_state.get("lang", "sv")
-            display_name = model_info.get("display_name_en" if current_lang == "en" else "display_name", model_key)
-            description = model_info.get("description_en" if current_lang == "en" else "description", "")
-            speed = model_info.get("speed", "")
-            quality = model_info.get("quality", "")
-
-            with st.container():
-                col1, col2 = st.columns([1, 5])
-                with col1:
-                    is_selected = st.radio(
-                        "select_embedding_model",
-                        options=[model_key],
-                        format_func=lambda x: "*" if x == current_embedding else "o",
-                        key=f"radio_{model_key}",
-                        label_visibility="collapsed"
-                    )
-                with col2:
-                    if model_key == current_embedding:
-                        st.markdown(f"**{display_name}** {speed} {quality}")
-                    else:
-                        st.markdown(f"{display_name} {speed} {quality}")
-                    st.caption(description)
-                st.markdown("---")
 
         embedding_model = st.selectbox(
             get_text("embedding_model"),
@@ -2098,6 +2153,7 @@ def main():
             )
 
         use_sources = st.checkbox(get_text("writing_use_sources"), value=st.session_state.get("writing_use_sources", True), key="writing_use_sources")
+        use_pipeline = st.checkbox(get_text("writing_pipeline"), value=st.session_state.get("writing_pipeline", False), key="writing_pipeline", help=get_text("writing_pipeline_help"))
 
         if st.button(get_text("writing_generate"), disabled=st.session_state.processing or not brief):
             llm = load_llm(st.session_state.device_choice)
@@ -2110,7 +2166,8 @@ def main():
                 lang,
                 st.session_state.vectorstore,
                 llm,
-                use_sources=use_sources
+                use_sources=use_sources,
+                use_pipeline=use_pipeline
             )
             st.session_state.writing_result = result
             st.session_state.writing_sources = used_sources

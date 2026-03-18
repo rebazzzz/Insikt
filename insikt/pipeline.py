@@ -4,15 +4,16 @@ import hashlib
 import importlib.util
 import os
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from shutil import which
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from docx import Document as DocxDocument
 from langchain_core.documents import Document
 
 from .common import compute_uploaded_files_fingerprint, docs_to_records, read_json, records_to_docs, write_json
+from .validation import resolve_tesseract_command
 
 
 StatusCallback = Optional[Callable[[str], None]]
@@ -33,7 +34,7 @@ def ocr_stack_available() -> bool:
     return (
         importlib.util.find_spec("pytesseract") is not None
         and importlib.util.find_spec("pypdfium2") is not None
-        and which("tesseract") is not None
+        and resolve_tesseract_command() is not None
     )
 
 
@@ -52,16 +53,43 @@ def ocr_pdf_file(pdf_path: str, source_name: str) -> List[Document]:
     import pypdfium2 as pdfium
     import pytesseract
 
-    pdf = pdfium.PdfDocument(pdf_path)
+    tesseract_cmd = resolve_tesseract_command()
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
     docs = []
-    for page_index in range(len(pdf)):
-        page = pdf[page_index]
-        bitmap = page.render(scale=2)
-        image = bitmap.to_pil()
-        text = pytesseract.image_to_string(image).strip()
-        if text:
-            docs.append(Document(page_content=text, metadata={"source": source_name, "page": str(page_index + 1), "ocr": True}))
+    pdf = pdfium.PdfDocument(pdf_path)
+    try:
+        for page_index in range(len(pdf)):
+            page = pdf[page_index]
+            bitmap = None
+            image = None
+            try:
+                bitmap = page.render(scale=2)
+                image = bitmap.to_pil()
+                text = pytesseract.image_to_string(image).strip()
+            finally:
+                if image is not None:
+                    image.close()
+                if bitmap is not None:
+                    bitmap.close()
+                page.close()
+            if text:
+                docs.append(Document(page_content=text, metadata={"source": source_name, "page": str(page_index + 1), "ocr": True}))
+    finally:
+        pdf.close()
     return docs
+
+
+def delete_temp_file(path: str, retries: int = 5, delay_seconds: float = 0.2) -> None:
+    for attempt in range(retries):
+        try:
+            os.unlink(path)
+            return
+        except PermissionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay_seconds)
 
 
 def _load_single_file_cached(uploaded_file, cache_root: Path, error_callback: ErrorCallback = None, status_callback: StatusCallback = None) -> tuple[list[Document], bool]:
@@ -116,7 +144,7 @@ def load_single_pdf(uploaded_file, error_callback: ErrorCallback = None, status_
         return []
     finally:
         if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            delete_temp_file(tmp_path)
 
 
 def load_single_text_file(uploaded_file) -> List[Document]:
@@ -139,7 +167,7 @@ def load_single_docx(uploaded_file) -> List[Document]:
         return [Document(page_content=text, metadata={"source": uploaded_file.name, "page": "1"})]
     finally:
         if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            delete_temp_file(tmp_path)
 
 
 def load_single_file(uploaded_file, error_callback: ErrorCallback = None, status_callback: StatusCallback = None) -> List[Document]:

@@ -1,6 +1,15 @@
 import unittest
+from unittest.mock import patch
 
-from insikt.validation import choose_model_variant, get_model_recommendations, resolve_installed_ollama_model
+from insikt.validation import (
+    choose_model_variant,
+    get_missing_python_packages,
+    get_model_recommendations,
+    get_tesseract_install_hint,
+    install_missing_python_packages,
+    resolve_tesseract_command,
+    resolve_installed_ollama_model,
+)
 
 
 class ValidationTests(unittest.TestCase):
@@ -26,6 +35,35 @@ class ValidationTests(unittest.TestCase):
         preset_map = {preset["key"]: preset for preset in presets}
         self.assertEqual(preset_map["balanced"]["llm_model"], "mistral:7b")
         self.assertTrue(preset_map["balanced"]["installed"])
+
+    @patch("insikt.validation.importlib.util.find_spec")
+    def test_missing_python_packages_map_import_names_to_pip_names(self, mock_find_spec):
+        mock_find_spec.side_effect = lambda name: None if name in {"pytesseract", "PIL"} else object()
+        missing = get_missing_python_packages(["pytesseract", "PIL", "streamlit"])
+        self.assertEqual(missing, [{"module": "pytesseract", "package": "pytesseract"}, {"module": "PIL", "package": "Pillow"}])
+
+    @patch("insikt.validation.install_python_packages")
+    @patch("insikt.validation.get_missing_python_packages")
+    def test_install_missing_python_packages_uses_unique_pip_names(self, mock_missing, mock_install):
+        mock_missing.return_value = [
+            {"module": "PIL", "package": "Pillow"},
+            {"module": "custom", "package": "Pillow"},
+            {"module": "ocr", "package": "pytesseract"},
+        ]
+        install_missing_python_packages()
+        mock_install.assert_called_once_with(["Pillow", "Pillow", "pytesseract"])
+
+    def test_windows_tesseract_hint_mentions_winget(self):
+        hint = get_tesseract_install_hint()
+        self.assertTrue("Tesseract" in hint)
+
+    @patch("insikt.validation.os.path.exists")
+    @patch("insikt.validation.which")
+    def test_resolve_tesseract_command_checks_common_windows_locations(self, mock_which, mock_exists):
+        mock_which.return_value = None
+        mock_exists.side_effect = lambda path: str(path).endswith("Tesseract-OCR\\tesseract.exe")
+        resolved = resolve_tesseract_command()
+        self.assertTrue(resolved.lower().endswith("tesseract.exe"))
 
 
 if __name__ == "__main__":

@@ -3,9 +3,47 @@ from __future__ import annotations
 import importlib.util
 import os
 import subprocess
+import sys
 from shutil import which
 
 import torch
+
+
+PACKAGE_INSTALL_MAP = {
+    "streamlit": "streamlit",
+    "torch": "torch",
+    "transformers": "transformers",
+    "langchain_community": "langchain-community",
+    "langchain_huggingface": "langchain-huggingface",
+    "langchain_ollama": "langchain-ollama",
+    "faiss": "faiss-cpu",
+    "pypdf": "pypdf",
+    "docx": "python-docx",
+    "fpdf": "fpdf",
+    "pytesseract": "pytesseract",
+    "pypdfium2": "pypdfium2",
+    "PIL": "Pillow",
+    "yake": "yake",
+    "sentence_transformers": "sentence-transformers",
+}
+
+REQUIRED_PYTHON_MODULES = [
+    "streamlit",
+    "torch",
+    "transformers",
+    "langchain_community",
+    "langchain_huggingface",
+    "langchain_ollama",
+    "faiss",
+    "pypdf",
+    "docx",
+    "fpdf",
+    "pytesseract",
+    "pypdfium2",
+    "PIL",
+    "yake",
+    "sentence_transformers",
+]
 
 
 def get_installed_ollama_models() -> list[str]:
@@ -43,8 +81,68 @@ def ollama_cli_available() -> bool:
     return which("ollama") is not None
 
 
+def resolve_tesseract_command() -> str | None:
+    discovered = which("tesseract")
+    if discovered:
+        return discovered
+    if os.name == "nt":
+        candidates = [
+            os.path.join(os.environ.get("ProgramFiles", ""), "Tesseract-OCR", "tesseract.exe"),
+            os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Tesseract-OCR", "tesseract.exe"),
+            os.path.join(os.environ.get("LocalAppData", ""), "Programs", "Tesseract-OCR", "tesseract.exe"),
+        ]
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+    return None
+
+
 def tesseract_cli_available() -> bool:
-    return which("tesseract") is not None
+    return resolve_tesseract_command() is not None
+
+
+def get_missing_python_packages(required_modules: list[str] | None = None) -> list[dict]:
+    required_modules = required_modules or REQUIRED_PYTHON_MODULES
+    missing = []
+    for module_name in required_modules:
+        if importlib.util.find_spec(module_name) is None:
+            missing.append(
+                {
+                    "module": module_name,
+                    "package": PACKAGE_INSTALL_MAP.get(module_name, module_name),
+                }
+            )
+    return missing
+
+
+def install_python_packages(packages: list[str]) -> list[str]:
+    unique_packages = []
+    for package in packages:
+        if package and package not in unique_packages:
+            unique_packages.append(package)
+    if not unique_packages:
+        return []
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", *unique_packages],
+        capture_output=True,
+        text=True,
+        timeout=1800000,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "pip install failed")
+    return unique_packages
+
+
+def install_missing_python_packages(required_modules: list[str] | None = None) -> list[str]:
+    missing = get_missing_python_packages(required_modules)
+    return install_python_packages([item["package"] for item in missing])
+
+
+def get_tesseract_install_hint() -> str:
+    if os.name == "nt":
+        return "Install Tesseract OCR with: winget install --id UB-Mannheim.TesseractOCR -e"
+    return "Install the Tesseract CLI and ensure the 'tesseract' command is on PATH."
 
 
 def get_system_memory_gb() -> float:
@@ -177,25 +275,15 @@ def get_model_recommendations(
 def run_startup_checks(llm_model: str, embedding_model: str) -> list[dict]:
     checks = []
     profile = get_system_profile()
-    required_modules = [
-        "streamlit",
-        "torch",
-        "transformers",
-        "langchain_community",
-        "langchain_huggingface",
-        "langchain_ollama",
-        "faiss",
-        "pypdf",
-        "docx",
-        "fpdf",
-        "pytesseract",
-        "pypdfium2",
-        "PIL",
-        "yake",
-        "sentence_transformers",
-    ]
-    missing = [name for name in required_modules if importlib.util.find_spec(name) is None]
-    checks.append({"name": "Python dependencies", "status": "ok" if not missing else "warning", "message": "All required packages detected." if not missing else f"Missing packages: {', '.join(missing)}"})
+    missing = get_missing_python_packages()
+    missing_names = [item["module"] for item in missing]
+    checks.append(
+        {
+            "name": "Python dependencies",
+            "status": "ok" if not missing else "warning",
+            "message": "All required packages detected." if not missing else f"Missing packages: {', '.join(missing_names)}",
+        }
+    )
     if profile["gpu_available"]:
         gpu_message = f"CUDA GPU available: {profile['gpu_name']} ({profile['vram_gb']} GB VRAM)."
         gpu_status = "ok"
@@ -228,5 +316,11 @@ def run_startup_checks(llm_model: str, embedding_model: str) -> list[dict]:
     if ocr_modules_ready and tesseract_cli_available():
         checks.append({"name": "OCR readiness", "status": "ok", "message": "OCR support is ready for scanned PDFs."})
     else:
-        checks.append({"name": "OCR readiness", "status": "info", "message": "Scanned PDF OCR needs pytesseract, pypdfium2, Pillow, and the Tesseract CLI."})
+        checks.append(
+            {
+                "name": "OCR readiness",
+                "status": "info",
+                "message": f"Scanned PDF OCR needs pytesseract, pypdfium2, Pillow, and the Tesseract CLI. {get_tesseract_install_hint()}",
+            }
+        )
     return checks

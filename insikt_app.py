@@ -7,9 +7,11 @@ Now with user-selectable GPU/CPU processing.
 
 import os
 import subprocess
+import sys
 import tempfile
 import pickle
 import re
+import shutil
 import threading
 import time
 from datetime import datetime
@@ -45,8 +47,10 @@ from transformers import pipeline
 import yake
 
 from insikt.analysis import analyze_sentiment, bias_check, compare_sources, extract_claim_check_items, extract_entities, extract_keywords, extract_quote_candidates, extract_timeline, translate_text
+from insikt import get_build_metadata
 from insikt.common import cleaned_ui_text, docs_to_records, records_to_docs, safe_html_fragment
 from insikt.exports import export_docx, export_markdown, export_pdf, export_text
+from insikt.feedback_store import build_feedback_bundle, list_issue_reports, save_issue_report
 from insikt.pipeline import build_or_load_vectorstore, get_cache_stats, process_uploaded_files as cached_process_uploaded_files, rechunk_pages
 from insikt.rag import chat_with_docs as rag_chat_with_docs
 from insikt.rag import generate_writing as rag_generate_writing
@@ -56,9 +60,12 @@ from insikt.summarization import SummaryThread as ModularSummaryThread
 from insikt.summarization import generate_doc_hash as modular_generate_doc_hash
 from insikt.ui import app_readiness_label, concise_model_label
 from insikt.validation import (
+    get_missing_python_packages,
     get_installed_ollama_models,
     get_model_recommendations,
     get_system_profile,
+    get_tesseract_install_hint,
+    install_missing_python_packages,
     resolve_installed_ollama_model,
     run_startup_checks,
 )
@@ -69,6 +76,7 @@ from insikt.validation import (
 APP_NAME = "Insikt"
 CACHE_ROOT = Path("session_data/cache")
 SAVES_ROOT = Path("session_data/saves")
+FEEDBACK_ROOT = Path("session_data/feedback")
 
 # LLM Models - Optimized for performance and accuracy
 # Quantized models are smaller, faster, and use less memory while maintaining good quality
@@ -1582,7 +1590,7 @@ def set_custom_css(basic_mode: bool = False):
     button_padding = "0.8rem 1.1rem" if basic_mode else "0.55rem 1.1rem"
     button_font = "1rem" if basic_mode else "0.95rem"
     input_font = "1rem" if basic_mode else "0.95rem"
-    st.markdown(f"""
+    css = """
     <style>
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:wght@500;600&display=swap');
     :root {
@@ -1598,7 +1606,7 @@ def set_custom_css(basic_mode: bool = False):
     }
     html, body, [class*="css"] {{
         font-family: 'IBM Plex Sans', sans-serif;
-        font-size: {base_font};
+        font-size: __BASE_FONT__;
     }}
     h1, h2, h3, .hero-title { font-family: 'Source Serif 4', serif; }
     .stApp {
@@ -1693,8 +1701,8 @@ def set_custom_css(basic_mode: bool = False):
         border: none;
         border-radius: 10px;
         font-weight: 600;
-        padding: {button_padding};
-        font-size: {button_font};
+        padding: __BUTTON_PADDING__;
+        font-size: __BUTTON_FONT__;
         min-height: 2.8rem;
         transition: all 0.2s ease;
     }}
@@ -1709,10 +1717,10 @@ def set_custom_css(basic_mode: bool = False):
         opacity: 0.6;
     }}
     .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"], .stMultiSelect div[data-baseweb="select"] {{
-        font-size: {input_font};
+        font-size: __INPUT_FONT__;
     }}
     .stCheckbox label, .stRadio label {{
-        font-size: {input_font};
+        font-size: __INPUT_FONT__;
     }}
     .stProgress > div > div > div > div { background-color: var(--accent); }
     .info-box {
@@ -1862,7 +1870,14 @@ def set_custom_css(basic_mode: bool = False):
         line-height: 1.5;
     }
     </style>
-    """, unsafe_allow_html=True)
+    """
+    css = (
+        css.replace("__BASE_FONT__", base_font)
+        .replace("__BUTTON_PADDING__", button_padding)
+        .replace("__BUTTON_FONT__", button_font)
+        .replace("__INPUT_FONT__", input_font)
+    )
+    st.markdown(css, unsafe_allow_html=True)
 
 
 SummaryThread = ModularSummaryThread
@@ -1885,6 +1900,48 @@ def refresh_source_options():
 
 def parse_tags(raw_value: str) -> list[str]:
     return [part.strip() for part in raw_value.split(",") if part.strip()]
+
+
+def build_issue_context(build_meta: dict) -> dict:
+    return {
+        "app_build": build_meta.get("label", ""),
+        "language": st.session_state.get("lang", "sv"),
+        "device_choice": st.session_state.get("device_choice", "auto"),
+        "llm_model": st.session_state.get("llm_model", DEFAULT_LLM_MODEL),
+        "embedding_model": st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL),
+        "loaded_sources": st.session_state.get("available_sources", []),
+        "doc_count": len(st.session_state.get("raw_pages") or []),
+        "chat_messages": len(st.session_state.get("chat_history") or []),
+        "summary_available": bool(st.session_state.get("last_summary")),
+        "writing_available": bool(st.session_state.get("writing_result")),
+    }
+
+
+def open_folder_in_file_manager(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+        return
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+        return
+    subprocess.Popen(["xdg-open", str(path)])
+
+
+def save_tester_issue(build_meta: dict) -> dict:
+    payload = {
+        "reporter_name": st.session_state.get("issue_reporter_name", "").strip(),
+        "severity": st.session_state.get("issue_severity", "Medium"),
+        "area": st.session_state.get("issue_area", "General"),
+        "title": st.session_state.get("issue_title", "").strip(),
+        "what_happened": st.session_state.get("issue_what_happened", "").strip(),
+        "expected": st.session_state.get("issue_expected", "").strip(),
+        "steps": st.session_state.get("issue_steps", "").strip(),
+        "work_context": st.session_state.get("issue_work_context", "").strip(),
+        "app_version_label": build_meta.get("label", ""),
+        "app_context": build_issue_context(build_meta),
+    }
+    return save_issue_report(FEEDBACK_ROOT, payload)
 
 
 def format_slot_timestamp(timestamp: str) -> str:
@@ -2245,6 +2302,22 @@ def recommended_startup_preset(recommendations: list[dict]) -> dict | None:
 
 def auto_fix_setup(primary_preset: dict, installed_models: list[str], lang: str) -> list[str]:
     actions = []
+    missing_packages = get_missing_python_packages()
+    if missing_packages:
+        try:
+            installed_package_names = install_missing_python_packages()
+            package_list = ", ".join(installed_package_names)
+            actions.append(
+                f"Installerade saknade Python-paket: {package_list}."
+                if lang == "sv"
+                else f"Installed missing Python packages: {package_list}."
+            )
+        except Exception as exc:
+            actions.append(
+                f"Kunde inte installera alla Python-paket automatiskt: {exc}"
+                if lang == "sv"
+                else f"Could not install all Python packages automatically: {exc}"
+            )
     if st.session_state.get("device_choice") == "cuda" and not torch.cuda.is_available():
         st.session_state.device_choice = "auto"
         actions.append("Återställde processorn till Auto." if lang == "sv" else "Reset processing device to Auto.")
@@ -2281,6 +2354,12 @@ def auto_fix_setup(primary_preset: dict, installed_models: list[str], lang: str)
             f"Valde rekommenderad sökprofil {primary_preset['embedding_model']}."
             if lang == "sv"
             else f"Selected recommended search profile {primary_preset['embedding_model']}."
+        )
+    if not shutil.which("tesseract"):
+        actions.append(
+            f"OCR behöver också Tesseract-kommandot i PATH. {get_tesseract_install_hint()}"
+            if lang == "sv"
+            else f"OCR also needs the Tesseract CLI on PATH. {get_tesseract_install_hint()}"
         )
     get_startup_checks.clear()
     load_llm.clear()
@@ -2390,6 +2469,14 @@ def main():
         "case_board_excerpts": [],
         "last_ingest_stats": {},
         "doc_fingerprint": "",
+        "issue_reporter_name": "",
+        "issue_severity": "Medium",
+        "issue_area": "General",
+        "issue_title": "",
+        "issue_what_happened": "",
+        "issue_expected": "",
+        "issue_steps": "",
+        "issue_work_context": "",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -2406,12 +2493,14 @@ def main():
         if target != st.session_state.get("last_citation_target", ""):
             select_preview_target(cite_source, str(cite_page or ""), origin="citation")
     system_profile = get_system_profile()
+    build_meta = get_build_metadata()
     checks = get_startup_checks(st.session_state.get("llm_model", DEFAULT_LLM_MODEL), st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
     readiness_state, readiness_text = app_readiness_label(st.session_state.get("docs"), st.session_state.get("processing", False))
     installed_models = get_installed_ollama_models()
     cache_stats = get_cache_stats(CACHE_ROOT)
     available_llm_options = get_available_llm_options(installed_models)
     recommendations = get_model_recommendations(installed_models, system_profile, list(LLM_MODELS.keys()))
+    recent_reports = list_issue_reports(FEEDBACK_ROOT, limit=12)
     primary_preset = recommended_startup_preset(recommendations)
     resolved_selected_model = resolve_installed_ollama_model(st.session_state.get("llm_model", DEFAULT_LLM_MODEL), installed_models)
     if installed_models and not resolved_selected_model:
@@ -2425,6 +2514,7 @@ def main():
 
     with st.sidebar:
         st.markdown(f"## {get_text('title')}")
+        st.caption(build_meta.get("label", ""))
         current_device = resolve_device(st.session_state.device_choice)
         if readiness_state == "ready":
             st.success("Kunskapsbas redo" if lang == "sv" else readiness_text)
@@ -2513,6 +2603,36 @@ def main():
             st.markdown("**Systemstatus**" if lang == "sv" else "**System status**")
             for check in checks:
                 render_system_check(check, lang)
+            missing_python_packages = get_missing_python_packages()
+            if missing_python_packages:
+                if st.button(
+                    "Installera saknade Python-paket" if lang == "sv" else "Install missing Python packages",
+                    use_container_width=True,
+                ):
+                    with st.spinner("Installerar paket..." if lang == "sv" else "Installing packages..."):
+                        try:
+                            installed_package_names = install_missing_python_packages()
+                            package_list = ", ".join(installed_package_names)
+                            st.success(
+                                f"Installerade: {package_list}"
+                                if lang == "sv"
+                                else f"Installed: {package_list}"
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(
+                                f"Kunde inte installera Python-paketen: {exc}"
+                                if lang == "sv"
+                                else f"Could not install the Python packages: {exc}"
+                            )
+            if not shutil.which("tesseract"):
+                st.caption(
+                    (
+                        f"För OCR på skannade PDF-filer behöver du också Tesseract. {get_tesseract_install_hint()}"
+                        if lang == "sv"
+                        else f"Scanned PDF OCR also needs Tesseract. {get_tesseract_install_hint()}"
+                    )
+                )
             if not basic_mode:
                 with st.expander("Tekniska detaljer" if lang == "sv" else "Technical details", expanded=False):
                     for check in checks:
@@ -2731,6 +2851,122 @@ def main():
                                 delete_slot(SAVES_ROOT, slot["slot_id"])
                                 st.rerun()
             st.caption("All behandling sker lokalt. Sparningar ligger i session_data/saves." if lang == "sv" else "All processing is local. Saves are stored in session_data/saves.")
+
+        with st.expander("Rapportera problem" if lang == "sv" else "Report issue", expanded=False):
+            st.caption(
+                "Berätta kort vad som gick fel. Appen sparar varje rapport separat så inget skrivs över."
+                if lang == "sv"
+                else "Describe what went wrong in simple words. The app saves each report separately, so nothing gets overwritten."
+            )
+            helper_col_a, helper_col_b = st.columns(2)
+            with helper_col_a:
+                if st.button("Öppna rapportmapp" if lang == "sv" else "Open feedback folder", use_container_width=True, key="open-feedback-folder"):
+                    try:
+                        open_folder_in_file_manager(FEEDBACK_ROOT / "reports")
+                        st.success("Rapportmappen öppnades." if lang == "sv" else "The feedback folder was opened.")
+                    except Exception as exc:
+                        st.error(f"Kunde inte öppna mappen: {exc}" if lang == "sv" else f"Could not open the folder: {exc}")
+            with helper_col_b:
+                st.caption(
+                    "Mapp: session_data/feedback/reports"
+                    if lang == "sv"
+                    else "Folder: session_data/feedback/reports"
+                )
+            with st.form("issue-report-form", clear_on_submit=False):
+                st.text_input("Ditt namn" if lang == "sv" else "Your name", key="issue_reporter_name", help="Valfritt." if lang == "sv" else "Optional.")
+                issue_col_a, issue_col_b = st.columns(2)
+                with issue_col_a:
+                    st.selectbox(
+                        "Hur stort problem är det?" if lang == "sv" else "How serious is it?",
+                        options=["Low", "Medium", "High", "Blocker"],
+                        key="issue_severity",
+                    )
+                with issue_col_b:
+                    st.selectbox(
+                        "Var hände det?" if lang == "sv" else "Where did it happen?",
+                        options=["General", "Setup", "Documents", "Chat", "Summary", "Writing", "Analysis", "Export", "Session save/load", "Performance"],
+                        key="issue_area",
+                    )
+                st.text_input(
+                    "Kort namn på problemet" if lang == "sv" else "Short name for the problem",
+                    key="issue_title",
+                    help="Exempel: Chatten gav fel namn eller PDF gick inte att läsa." if lang == "sv" else "Example: Chat gave the wrong name or PDF would not load.",
+                )
+                st.text_area(
+                    "Vad gick fel?" if lang == "sv" else "What went wrong?",
+                    key="issue_what_happened",
+                    height=120,
+                    help="Beskriv med egna ord." if lang == "sv" else "Describe it in your own words.",
+                )
+                st.text_area(
+                    "Vad hade varit rätt?" if lang == "sv" else "What should have happened?",
+                    key="issue_expected",
+                    height=90,
+                )
+                st.text_area(
+                    "Vad gjorde du precis innan?" if lang == "sv" else "What did you do right before it happened?",
+                    key="issue_steps",
+                    height=100,
+                    help="Skriv gärna steg för steg om du minns." if lang == "sv" else "Step by step is helpful if you remember.",
+                )
+                st.text_area(
+                    "Vad försökte du få gjort?" if lang == "sv" else "What were you trying to get done?",
+                    key="issue_work_context",
+                    height=90,
+                    help="Till exempel sammanfatta en intervju eller hitta citat." if lang == "sv" else "For example: summarize an interview or find quotes.",
+                )
+                submitted = st.form_submit_button("Skicka och spara rapport" if lang == "sv" else "Save this report", use_container_width=True)
+            if submitted:
+                required_fields = [
+                    st.session_state.get("issue_title", "").strip(),
+                    st.session_state.get("issue_what_happened", "").strip(),
+                ]
+                if not all(required_fields):
+                    st.warning("Fyll i minst problemets namn och vad som gick fel." if lang == "sv" else "Please fill in at least the problem name and what went wrong.")
+                else:
+                    saved_report = save_tester_issue(build_meta)
+                    st.success(
+                        (
+                            f"Rapport sparad: {saved_report['report_id']}. Den finns i rapportmappen och i listan här nedanför."
+                            if lang == "sv"
+                            else f"Report saved: {saved_report['report_id']}. It is now in the feedback folder and in the list below."
+                        )
+                    )
+                    st.code(saved_report["report_id"])
+                    recent_reports = list_issue_reports(FEEDBACK_ROOT, limit=12)
+
+            report_count = len(recent_reports)
+            st.caption(
+                f"{report_count} sparade rapporter"
+                if lang == "sv"
+                else f"{report_count} saved reports"
+            )
+            if recent_reports:
+                bundle_bytes = build_feedback_bundle(FEEDBACK_ROOT, [report["report_id"] for report in recent_reports])
+                st.download_button(
+                    "Ladda ner rapportpaket" if lang == "sv" else "Download report bundle",
+                    data=bundle_bytes,
+                    file_name="insikt-feedback-bundle.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    key="download-feedback-bundle",
+                )
+                for report in recent_reports[:6]:
+                    label = f"{report.get('created_at', '')[:16]} | {report.get('severity', '')} | {report.get('title', '')}"
+                    with st.expander(label, expanded=False):
+                        st.caption(report.get("report_id", ""))
+                        st.write(report.get("what_happened", ""))
+                        st.caption(report.get("markdown_path", ""))
+                        markdown_path = Path(report.get("markdown_path", ""))
+                        if markdown_path.exists():
+                            st.download_button(
+                                "Ladda ner rapport" if lang == "sv" else "Download report",
+                                data=markdown_path.read_bytes(),
+                                file_name=markdown_path.name,
+                                mime="text/markdown",
+                                key=f"download-report-{report.get('report_id', '')}",
+                                use_container_width=True,
+                            )
 
     if st.session_state.processing:
         st.markdown("""
@@ -3395,6 +3631,7 @@ def main():
 
     st.divider()
     st.caption("Insikt - 100% lokalt, privat och gratis." if lang == "sv" else "Insikt - 100% local, private, and free.")
+    st.caption(build_meta.get("label", ""))
     if st.session_state.summary_running:
         time.sleep(0.3)
         st.rerun()
@@ -3403,6 +3640,27 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
+        try:
+            build_meta = get_build_metadata()
+            save_issue_report(
+                FEEDBACK_ROOT,
+                {
+                    "reporter_name": "system",
+                    "severity": "Blocker",
+                    "area": "Crash",
+                    "title": "Critical app crash",
+                    "what_happened": str(e),
+                    "expected": "App should stay running.",
+                    "steps": "Crash happened during startup or runtime.",
+                    "work_context": "Automatic crash capture",
+                    "app_version_label": build_meta.get("label", ""),
+                    "app_context": {
+                        "language": st.session_state.get("lang", "sv") if "lang" in st.session_state else "sv",
+                    },
+                },
+            )
+        except Exception:
+            pass
         st.error("Ett kritiskt fel uppstod. Starta om appen." if st.session_state.get("lang","sv")=="sv" else "A critical error occurred. Please restart the app.")
         st.exception(e)
 

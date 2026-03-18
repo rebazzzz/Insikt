@@ -43,7 +43,7 @@ from transformers import pipeline
 import yake
 
 from insikt.analysis import analyze_sentiment, bias_check, extract_entities, extract_keywords, extract_timeline, translate_text
-from insikt.common import cleaned_ui_text
+from insikt.common import cleaned_ui_text, docs_to_records, records_to_docs
 from insikt.exports import export_docx, export_markdown, export_pdf, export_text
 from insikt.pipeline import build_or_load_vectorstore, process_uploaded_files as cached_process_uploaded_files, rechunk_pages
 from insikt.rag import chat_with_docs as rag_chat_with_docs
@@ -1870,24 +1870,39 @@ def prettify_citations_for_display(text: str, lang: str):
     cleaned = re.sub(pattern, replacer, text, flags=re.IGNORECASE)
     register = []
     for source, page in source_order:
-        label = f"[{source_map[(source, page)]}] {source}, {'sida' if lang == 'sv' else 'page'} {page}"
-        register.append(label)
+        register.append(
+            {
+                "index": source_map[(source, page)],
+                "source": source,
+                "page": page,
+                "label": f"[{source_map[(source, page)]}] {source}, {'sida' if lang == 'sv' else 'page'} {page}",
+            }
+        )
     return cleaned, register
 
 
-def render_citation_register(register: list[str], lang: str):
+def render_citation_register(register: list[dict], lang: str, key_prefix: str):
     if not register:
         return
     st.markdown('<div class="citation-register">', unsafe_allow_html=True)
     st.markdown("**Källregister**" if lang == "sv" else "**Citation Register**")
     for item in register:
-        st.markdown(f"- {item}")
+        col_a, col_b = st.columns([1, 12])
+        with col_a:
+            if st.button(f"[{item['index']}]", key=f"{key_prefix}-cite-{item['index']}"):
+                st.session_state.selected_preview_source = item["source"]
+                st.session_state.selected_preview_page = str(item["page"])
+                st.rerun()
+        with col_b:
+            st.markdown(item["label"])
     st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_source_snippets(sources, lang: str, key_prefix: str):
     if not sources:
         return
+    if sources and isinstance(sources[0], dict):
+        sources = records_to_docs(sources)
     with st.expander("Visa källutdrag" if lang == "sv" else "Show source excerpts", expanded=False):
         for source_index, doc in enumerate(sources[:5]):
             src = doc.metadata.get("source", "Unknown")
@@ -2229,6 +2244,8 @@ def main():
             else:
                 body, notes = split_assistant_content(msg["content"])
                 body, register = prettify_citations_for_display(body or msg["content"], lang)
+                message_sources = msg.get("sources", [])
+                message_issues = msg.get("issues", [])
                 with st.chat_message("assistant"):
                     st.markdown(body)
                     tools_left, tools_right = st.columns([1, 1])
@@ -2236,20 +2253,23 @@ def main():
                         copy_block(msg["content"], key=f"copy-{idx}")
                     with tools_right:
                         st.download_button("Ladda ner svar" if lang == "sv" else "Download answer", data=msg["content"].encode("utf-8"), file_name=f"insikt-answer-{idx + 1}.txt", mime="text/plain", key=f"download-answer-{idx}")
-                    render_citation_register(register, lang)
-                    if notes:
+                    render_citation_register(register, lang, key_prefix=f"history-{idx}")
+                    if notes or message_issues:
                         st.markdown('<div class="chat-notes">', unsafe_allow_html=True)
                         st.markdown("**Att kontrollera**" if lang == "sv" else "**Check these notes**")
                         for note in notes:
                             st.markdown(f"- {note}")
+                        if message_issues:
+                            st.markdown("- " + ("Vissa delar av svaret behöver dubbelkontroll." if lang == "sv" else "Parts of the answer may need verification."))
                         st.markdown("</div>", unsafe_allow_html=True)
+                    render_source_snippets(message_sources, lang, key_prefix=f"history-{idx}")
         if prompt := st.chat_input(get_text("chat_input"), disabled=st.session_state.processing):
             st.session_state.chat_history.append({"role": "user", "content": prompt})
             with st.spinner("Tänker..." if lang == "sv" else "Thinking..."):
                 llm = load_llm(st.session_state.device_choice)
                 history_lc = [HumanMessage(content=m["content"]) if m["role"] == "user" else AIMessage(content=m["content"]) for m in st.session_state.chat_history[:-1]]
                 answer, sources, issues = rag_chat_with_docs(prompt, history_lc, st.session_state.vectorstore, llm, st.session_state.lang, source_filter=st.session_state.get("chat_source_filter") or None)
-            st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            st.session_state.chat_history.append({"role": "assistant", "content": answer, "sources": docs_to_records(sources), "issues": issues})
             body, notes = split_assistant_content(answer)
             body, register = prettify_citations_for_display(body or answer, lang)
             with st.chat_message("assistant"):
@@ -2259,7 +2279,7 @@ def main():
                     copy_block(answer, key="copy-latest")
                 with tools_right:
                     st.download_button("Ladda ner svar" if lang == "sv" else "Download answer", data=answer.encode("utf-8"), file_name="insikt-answer-latest.txt", mime="text/plain", key="download-answer-latest")
-                render_citation_register(register, lang)
+                render_citation_register(register, lang, key_prefix="latest")
                 if notes or issues:
                     st.markdown('<div class="chat-notes">', unsafe_allow_html=True)
                     st.markdown("**Att kontrollera**" if lang == "sv" else "**Check these notes**")
@@ -2350,7 +2370,7 @@ def main():
             st.markdown("### " + ("Sammanfattning" if lang == "sv" else "Summary"))
             summary_body, summary_register = prettify_citations_for_display(st.session_state.summary_result, lang)
             st.markdown(summary_body)
-            render_citation_register(summary_register, lang)
+            render_citation_register(summary_register, lang, key_prefix="summary")
             st.session_state.last_summary = st.session_state.summary_result
             st.success(get_text("success_summary"))
             st.download_button("Ladda ner sammanfattning" if lang == "sv" else "Download summary", data=st.session_state.summary_result.encode("utf-8"), file_name="insikt-summary.txt", mime="text/plain")
@@ -2402,7 +2422,7 @@ def main():
             st.markdown("### " + get_text("writing_result"))
             writing_body, writing_register = prettify_citations_for_display(st.session_state.writing_result, lang)
             st.markdown(writing_body)
-            render_citation_register(writing_register, lang)
+            render_citation_register(writing_register, lang, key_prefix="writing")
             sources = st.session_state.get("writing_sources", [])
             render_source_snippets(sources, lang, "writing")
 

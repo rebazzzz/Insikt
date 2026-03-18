@@ -2994,10 +2994,6 @@ def main():
             </div>
             """, unsafe_allow_html=True)
     with col_right:
-        preview_source = st.session_state.get("selected_preview_source", "")
-        preview_page = st.session_state.get("selected_preview_page", "")
-        preview_excerpt = st.session_state.get("preview_excerpt", "")
-        preview_docs = [doc for doc in (st.session_state.get("raw_pages") or []) if doc.metadata.get("source") == preview_source]
         st.markdown(f"""
             <div class="card">
                 <strong>{'Snabbstart' if lang == 'sv' else 'Quick Start'}</strong>
@@ -3008,6 +3004,14 @@ def main():
                 </div>
             </div>
             """, unsafe_allow_html=True)
+
+    main_col_left, main_col_right = st.columns([5, 4], vertical_alignment="top")
+
+    with main_col_right:
+        preview_source = st.session_state.get("selected_preview_source", "")
+        preview_page = st.session_state.get("selected_preview_page", "")
+        preview_excerpt = st.session_state.get("preview_excerpt", "")
+        preview_docs = [doc for doc in (st.session_state.get("raw_pages") or []) if doc.metadata.get("source") == preview_source]
         if st.session_state.get("available_sources"):
             st.markdown("### " + ("Dokumentnavigator" if lang == "sv" else "Document Navigator"))
             navigator_source = st.selectbox(
@@ -3073,7 +3077,7 @@ def main():
                 )
             st.text_area("Preview", selected_doc.page_content[:2500], height=220)
 
-    tab_chat, tab_summary, tab_write, tab_analysis, tab_board, tab_export = st.tabs(["Chat", "Sammanfatta" if lang == "sv" else "Summary", "Skrivstudio" if lang == "sv" else "Writing Studio", "Analys" if lang == "sv" else "Analysis", "Case board" if lang == "en" else "Case board", "Export"])
+    tab_chat, tab_summary, tab_write, tab_analysis, tab_board, tab_export = main_col_left.tabs(["Chat", "Sammanfatta" if lang == "sv" else "Summary", "Skrivstudio" if lang == "sv" else "Writing Studio", "Analys" if lang == "sv" else "Analysis", "Case board" if lang == "en" else "Case board", "Export"])
 
     with tab_chat:
         render_page_header(

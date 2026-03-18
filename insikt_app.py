@@ -6,6 +6,7 @@ Now with user-selectable GPU/CPU processing.
 """
 
 import os
+import subprocess
 import tempfile
 import pickle
 import re
@@ -51,7 +52,7 @@ from insikt.session_store import delete_slot, list_save_slots, load_slot, save_s
 from insikt.summarization import SummaryThread as ModularSummaryThread
 from insikt.summarization import generate_doc_hash as modular_generate_doc_hash
 from insikt.ui import app_readiness_label, concise_model_label
-from insikt.validation import get_installed_ollama_models, run_startup_checks
+from insikt.validation import get_installed_ollama_models, resolve_installed_ollama_model, run_startup_checks
 
 # -------------------------------------------------------------------
 # Configuration & Language
@@ -384,7 +385,11 @@ def resolve_device(choice):
 def load_llm(_device_choice, _model_key=None):  # device_choice is not used directly but forces cache invalidation
     model_key = _model_key or st.session_state.get("llm_model", DEFAULT_LLM_MODEL)
     installed_models = get_installed_ollama_models()
-    if installed_models and model_key not in installed_models:
+    resolved_model = resolve_installed_ollama_model(model_key, installed_models)
+    if installed_models and resolved_model and resolved_model != model_key:
+        model_key = resolved_model
+        st.session_state.llm_model = resolved_model
+    elif installed_models and not resolved_model:
         fallback = "llama3.2:latest" if "llama3.2:latest" in installed_models else installed_models[0]
         st.warning(
             (
@@ -393,8 +398,8 @@ def load_llm(_device_choice, _model_key=None):  # device_choice is not used dire
                 else f"Selected model '{model_key}' is not installed. Falling back to '{fallback}'."
             )
         )
-        model_key = fallback
         st.session_state.llm_model = fallback
+        model_key = fallback
     try:
         return ChatOllama(model=model_key, temperature=0.3, num_predict=2048)
     except Exception as e:
@@ -1751,6 +1756,53 @@ def render_page_help(title: str, body: str):
     with st.expander(f"? {title}", expanded=False):
         st.write(body)
 
+
+def get_llm_option_info(model_key: str) -> dict:
+    if model_key in LLM_MODELS:
+        return LLM_MODELS[model_key]
+    base_key = model_key.split(":", 1)[0]
+    if base_key in LLM_MODELS:
+        return LLM_MODELS[base_key]
+    return {
+        "display_name": model_key,
+        "display_name_en": model_key,
+        "description": "Installerad lokal modell.",
+        "description_en": "Installed local model.",
+        "speed": "",
+        "quality": "",
+        "memory": "",
+    }
+
+
+def get_available_llm_options(installed_models: list[str]) -> list[str]:
+    return installed_models if installed_models else list(LLM_MODELS.keys())
+
+
+def render_system_check(check: dict, lang: str):
+    friendly_names = {
+        "Python dependencies": "Appens komponenter" if lang == "sv" else "App components",
+        "GPU readiness": "Grafikprocessor" if lang == "sv" else "GPU",
+        "Ollama": "Ollama-tjänst" if lang == "sv" else "Ollama service",
+        "Selected LLM": "Vald språkmodell" if lang == "sv" else "Selected language model",
+        "Embedding profile": "Sökprofil" if lang == "sv" else "Search profile",
+    }
+    title = friendly_names.get(check["name"], check["name"])
+    line = f"{title}: {cleaned_ui_text(check['message'])}"
+    if check["status"] == "warning":
+        st.warning(line)
+    elif check["status"] == "ok":
+        st.success(line)
+    else:
+        st.info(line)
+
+
+def pull_ollama_model(model_name: str):
+    result = subprocess.run(["ollama", "pull", model_name], capture_output=True, text=True, timeout=1800000, check=False)
+    get_startup_checks.clear()
+    load_llm.clear()
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"Failed to pull {model_name}")
+
 # -------------------------------------------------------------------
 # Main app
 # -------------------------------------------------------------------
@@ -1814,9 +1866,16 @@ def main():
     checks = get_startup_checks(st.session_state.get("llm_model", DEFAULT_LLM_MODEL), st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
     readiness_state, readiness_text = app_readiness_label(st.session_state.get("docs"), st.session_state.get("processing", False))
     installed_models = get_installed_ollama_models()
-    if installed_models and st.session_state.get("llm_model") not in installed_models:
+    available_llm_options = get_available_llm_options(installed_models)
+    resolved_selected_model = resolve_installed_ollama_model(st.session_state.get("llm_model", DEFAULT_LLM_MODEL), installed_models)
+    if installed_models and not resolved_selected_model:
         preferred_model = "llama3.2:latest" if "llama3.2:latest" in installed_models else installed_models[0]
         st.session_state.llm_model = preferred_model
+        resolved_selected_model = preferred_model
+    selected_llm_value = resolved_selected_model or st.session_state.get("llm_model", DEFAULT_LLM_MODEL)
+    if selected_llm_value not in available_llm_options and available_llm_options:
+        selected_llm_value = available_llm_options[0]
+        st.session_state.llm_model = selected_llm_value
 
     with st.sidebar:
         st.markdown(f"## {get_text('title')}")
@@ -1840,26 +1899,41 @@ def main():
                 st.rerun()
             st.caption(get_text("device_info"))
             st.caption(get_text("ollama_gpu_note"))
+            st.markdown("**Systemstatus**" if lang == "sv" else "**System status**")
             for check in checks:
-                line = f"{check['name']}: {cleaned_ui_text(check['message'])}"
-                if check["status"] == "warning":
-                    st.warning(line)
-                elif check["status"] == "ok":
-                    st.success(line)
-                else:
-                    st.info(line)
+                render_system_check(check, lang)
+            with st.expander("Tekniska detaljer" if lang == "sv" else "Technical details", expanded=False):
+                for check in checks:
+                    st.caption(f"{check['name']}: {cleaned_ui_text(check['message'])}")
 
         with st.expander("Models", expanded=True):
             llm_model = st.selectbox(
                 get_text("llm_model"),
-                options=list(LLM_MODELS.keys()),
-                index=list(LLM_MODELS.keys()).index(st.session_state.get("llm_model", DEFAULT_LLM_MODEL)),
-                format_func=lambda key: concise_model_label(LLM_MODELS.get(key, {}), lang),
-                help=("Installerade Ollama-modeller: " + ", ".join(installed_models)) if (lang == "sv" and installed_models) else (("Installed Ollama models: " + ", ".join(installed_models)) if installed_models else None),
+                options=available_llm_options,
+                index=available_llm_options.index(selected_llm_value) if available_llm_options else 0,
+                format_func=lambda key: concise_model_label(get_llm_option_info(key), lang),
+                help=("Visar installerade Ollama-modeller på den här datorn." if lang == "sv" else "Shows Ollama models installed on this computer."),
             )
             if llm_model != st.session_state.get("llm_model", DEFAULT_LLM_MODEL):
                 st.session_state.llm_model = llm_model
                 st.rerun()
+            missing_known_models = [model for model in LLM_MODELS.keys() if model not in installed_models]
+            if missing_known_models:
+                download_target = st.selectbox(
+                    "Ladda ner modell" if lang == "sv" else "Download model",
+                    options=missing_known_models,
+                    format_func=lambda key: concise_model_label(get_llm_option_info(key), lang),
+                    help="Hämtar modellen via Ollama och gör den tillgänglig i appen." if lang == "sv" else "Downloads the model with Ollama and makes it available in the app.",
+                )
+                if st.button("Ladda ner vald modell" if lang == "sv" else "Download selected model", use_container_width=True):
+                    with st.spinner(("Laddar ner modell..." if lang == "sv" else "Downloading model...")):
+                        try:
+                            pull_ollama_model(download_target)
+                            st.success((f"Modellen {download_target} är installerad." if lang == "sv" else f"Model {download_target} is installed."))
+                            st.session_state.llm_model = download_target
+                            st.rerun()
+                        except Exception as exc:
+                            st.error((f"Kunde inte ladda ner modellen: {exc}" if lang == "sv" else f"Could not download model: {exc}"))
             embedding_model = st.selectbox(
                 get_text("embedding_model"),
                 options=list(EMBEDDING_MODELS.keys()),

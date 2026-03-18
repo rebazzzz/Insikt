@@ -21,6 +21,22 @@ def get_installed_ollama_models() -> list[str]:
         return []
 
 
+def resolve_installed_ollama_model(requested_model: str, installed_models: list[str]) -> str | None:
+    if not installed_models:
+        return requested_model
+    if requested_model in installed_models:
+        return requested_model
+    if ":" not in requested_model:
+        latest_variant = f"{requested_model}:latest"
+        if latest_variant in installed_models:
+            return latest_variant
+    base_name = requested_model.split(":", 1)[0]
+    for model_name in installed_models:
+        if model_name == base_name or model_name.startswith(base_name + ":"):
+            return model_name
+    return None
+
+
 def run_startup_checks(llm_model: str, embedding_model: str) -> list[dict]:
     checks = []
     required_modules = [
@@ -46,8 +62,9 @@ def run_startup_checks(llm_model: str, embedding_model: str) -> list[dict]:
         result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=5, check=False)
         has_ollama = result.returncode == 0
         checks.append({"name": "Ollama", "status": "ok" if has_ollama else "warning", "message": "Ollama responded successfully." if has_ollama else "Ollama did not respond. Start it before using chat or summaries."})
-        if llm_model in installed_models:
-            msg = f"Model '{llm_model}' detected."
+        resolved_model = resolve_installed_ollama_model(llm_model, installed_models)
+        if resolved_model:
+            msg = f"Model '{llm_model}' detected as '{resolved_model}'."
             status = "ok"
         elif installed_models:
             msg = f"Model '{llm_model}' was not found. Installed models: {', '.join(installed_models[:5])}."

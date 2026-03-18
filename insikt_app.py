@@ -51,7 +51,7 @@ from insikt.session_store import delete_slot, list_save_slots, load_slot, save_s
 from insikt.summarization import SummaryThread as ModularSummaryThread
 from insikt.summarization import generate_doc_hash as modular_generate_doc_hash
 from insikt.ui import app_readiness_label, concise_model_label
-from insikt.validation import run_startup_checks
+from insikt.validation import get_installed_ollama_models, run_startup_checks
 
 # -------------------------------------------------------------------
 # Configuration & Language
@@ -100,7 +100,7 @@ LLM_MODELS = {
         "memory": "High",
     },
 }
-DEFAULT_LLM_MODEL = "llama3.2:3b"  # Default to fast quantized model
+DEFAULT_LLM_MODEL = "llama3.2:latest"
 
 # Chunking strategies
 CHUNKING_STRATEGIES = {
@@ -382,8 +382,19 @@ def resolve_device(choice):
 # We'll cache resources with a dependency on device choice so they reload when device changes.
 @st.cache_resource(show_spinner=False)
 def load_llm(_device_choice, _model_key=None):  # device_choice is not used directly but forces cache invalidation
-    # Get the model from session state or use default
     model_key = _model_key or st.session_state.get("llm_model", DEFAULT_LLM_MODEL)
+    installed_models = get_installed_ollama_models()
+    if installed_models and model_key not in installed_models:
+        fallback = "llama3.2:latest" if "llama3.2:latest" in installed_models else installed_models[0]
+        st.warning(
+            (
+                f"Vald modell '{model_key}' finns inte installerad. Byter till '{fallback}'."
+                if st.session_state.get("lang", "sv") == "sv"
+                else f"Selected model '{model_key}' is not installed. Falling back to '{fallback}'."
+            )
+        )
+        model_key = fallback
+        st.session_state.llm_model = fallback
     try:
         return ChatOllama(model=model_key, temperature=0.3, num_predict=2048)
     except Exception as e:
@@ -897,7 +908,7 @@ Final summary:"""
                 sources_list = _build_sources_list(self.docs, self.lang)
                 self.result = _citation_fix(self.result, self.lang, llm, sources_list)
                 if not _has_citations(self.result, self.lang):
-                    warning = "\n\nOBS: K?llor kunde inte verifieras." if self.lang == "sv" else "\n\nNote: Citations could not be verified."
+                    warning = "\n\nOBS: Källor kunde inte verifieras." if self.lang == "sv" else "\n\nNote: Citations could not be verified."
                     self.result += warning
         except Exception as e:
             self.error = str(e)
@@ -1143,14 +1154,14 @@ def _citation_fix(text, lang, llm, sources_list):
     if not sources_list:
         return text
     if lang == "sv":
-        prompt = f"""Du ?r en redakt?r. L?gg till tydliga k?llh?nvisningar i texten.
-Anv?nd endast denna lista ?ver k?llor:
+        prompt = f"""Du är en redaktör. Lägg till tydliga källhänvisningar i texten.
+Använd endast denna lista över källor:
 {sources_list}
 
 Text:
 {text}
 
-Uppdaterad text med k?llor:"""
+Uppdaterad text med källor:"""
     else:
         prompt = f"""You are an editor. Add clear citations to the text.
 Use only this list of sources:
@@ -1192,9 +1203,9 @@ def generate_writing(brief, role_key, format_key, tone_key, length_key, lang, ve
         if use_pipeline and format_key == "documentary":
             outline_prompt = prompt + ("\n\nSteg 1: Skapa en tydlig disposition." if lang == "sv" else "\n\nStep 1: Create a clear outline.")
             outline = llm.invoke(outline_prompt).content
-            scene_prompt = ("\n\nSteg 2: Skapa en scenlista baserat p? dispositionen:\n" if lang == "sv" else "\n\nStep 2: Create a scene list based on the outline:\n") + outline
+            scene_prompt = ("\n\nSteg 2: Skapa en scenlista baserat på dispositionen:\n" if lang == "sv" else "\n\nStep 2: Create a scene list based on the outline:\n") + outline
             scenes = llm.invoke(scene_prompt).content
-            script_prompt = ("\n\nSteg 3: Skriv slutligt manus baserat p? scenlistan:\n" if lang == "sv" else "\n\nStep 3: Write the final script based on the scene list:\n") + scenes
+            script_prompt = ("\n\nSteg 3: Skriv slutligt manus baserat på scenlistan:\n" if lang == "sv" else "\n\nStep 3: Write the final script based on the scene list:\n") + scenes
             response = llm.invoke(script_prompt).content
             response = f"{outline}\n\n{scenes}\n\n{response}"
         else:
@@ -1205,7 +1216,7 @@ def generate_writing(brief, role_key, format_key, tone_key, length_key, lang, ve
     if use_sources and context_docs and not _has_citations(response, lang):
         response = _citation_fix(response, lang, llm, sources_list)
         if not _has_citations(response, lang):
-            warning = "\n\nOBS: K?llor kunde inte verifieras." if lang == "sv" else "\n\nNote: Citations could not be verified."
+            warning = "\n\nOBS: Källor kunde inte verifieras." if lang == "sv" else "\n\nNote: Citations could not be verified."
             response += warning
     return response, context_docs
 
@@ -1733,8 +1744,12 @@ def copy_block(text: str, key: str):
         </button>
         """,
         height=42,
-        key=key,
     )
+
+
+def render_page_help(title: str, body: str):
+    with st.expander(f"? {title}", expanded=False):
+        st.write(body)
 
 # -------------------------------------------------------------------
 # Main app
@@ -1798,6 +1813,10 @@ def main():
     lang = st.session_state.lang
     checks = get_startup_checks(st.session_state.get("llm_model", DEFAULT_LLM_MODEL), st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
     readiness_state, readiness_text = app_readiness_label(st.session_state.get("docs"), st.session_state.get("processing", False))
+    installed_models = get_installed_ollama_models()
+    if installed_models and st.session_state.get("llm_model") not in installed_models:
+        preferred_model = "llama3.2:latest" if "llama3.2:latest" in installed_models else installed_models[0]
+        st.session_state.llm_model = preferred_model
 
     with st.sidebar:
         st.markdown(f"## {get_text('title')}")
@@ -1805,7 +1824,7 @@ def main():
         if readiness_state == "ready":
             st.success("Kunskapsbas redo" if lang == "sv" else readiness_text)
         elif readiness_state == "processing":
-            st.info("Bearbetning p?g?r" if lang == "sv" else readiness_text)
+            st.info("Bearbetning pågår. Appen arbetar i bakgrunden och kan ta en stund beroende på filstorlek och modell." if lang == "sv" else "Processing is in progress. The app is still working and may take a while depending on file size and model.")
         else:
             st.warning("Ingen kunskapsbas laddad" if lang == "sv" else readiness_text)
         st.caption(get_text("device_current").format(current_device.upper()))
@@ -1836,6 +1855,7 @@ def main():
                 options=list(LLM_MODELS.keys()),
                 index=list(LLM_MODELS.keys()).index(st.session_state.get("llm_model", DEFAULT_LLM_MODEL)),
                 format_func=lambda key: concise_model_label(LLM_MODELS.get(key, {}), lang),
+                help=("Installerade Ollama-modeller: " + ", ".join(installed_models)) if (lang == "sv" and installed_models) else (("Installed Ollama models: " + ", ".join(installed_models)) if installed_models else None),
             )
             if llm_model != st.session_state.get("llm_model", DEFAULT_LLM_MODEL):
                 st.session_state.llm_model = llm_model
@@ -1879,8 +1899,8 @@ def main():
                     if st.button("X", key=f"remove-source-{source}", use_container_width=True):
                         remove_source(source)
                         st.rerun()
-            st.text_input("Namn p? sparning" if lang == "sv" else "Save name", key="save_slot_name")
-            if st.button("Spara nuvarande l?ge" if lang == "sv" else "Save current slot", use_container_width=True, disabled=st.session_state.processing):
+            st.text_input("Namn på sparning" if lang == "sv" else "Save name", key="save_slot_name", help="Ge sparningen ett eget namn så att du kan ladda den senare." if lang == "sv" else "Give this save a name so you can load it later.")
+            if st.button("Spara nuvarande läge" if lang == "sv" else "Save current slot", use_container_width=True, disabled=st.session_state.processing, help="Sparar dokument, chatt, sammanfattning och index i en egen sparning." if lang == "sv" else "Saves documents, chat, summary, and index into its own save slot."):
                 if st.session_state.get("docs"):
                     slot_name = st.session_state.get("save_slot_name") or f"Save {len(list_save_slots(SAVES_ROOT)) + 1}"
                     slot_id = save_slot(SAVES_ROOT, slot_name, st.session_state.get("docs") or [], st.session_state.get("raw_pages") or [], st.session_state.get("chat_history") or [], st.session_state.get("last_summary", ""), st.session_state.get("lang", "sv"), st.session_state.get("vectorstore"), st.session_state.get("doc_fingerprint", ""))
@@ -1889,7 +1909,7 @@ def main():
                     st.warning("Inget att spara" if lang == "sv" else "Nothing to save")
             save_slots = list_save_slots(SAVES_ROOT)
             if save_slots:
-                st.caption("Sparade l?gen" if lang == "sv" else "Saved slots")
+                st.caption("Sparade lägen" if lang == "sv" else "Saved slots")
             for slot in save_slots:
                 st.markdown(f"**{slot.get('name', slot.get('slot_id'))}**")
                 st.caption(f"{slot.get('doc_count', 0)} {'segment' if lang == 'sv' else 'chunks'} | {slot.get('updated_at', '')[:19]}")
@@ -1912,7 +1932,7 @@ def main():
             <div class="processing-box">
                 <h3>""" + get_text("processing") + """</h3>
                 <div class="stProgress"><div style="width:100%; background:#d97706; height:4px;"></div></div>
-                <p>Var god v?nta...</p>
+                <p>Bearbetning pågår. Stäng inte appen medan dokumenten förbereds.</p>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1941,12 +1961,12 @@ def main():
                 <div style="margin-top: 0.6rem; color: #475569;">
                     1) {'Ladda upp filer och bygg kunskapsbasen' if lang == 'sv' else 'Upload files and build the knowledge base'}<br>
                     2) {'Chatta, sammanfatta eller skriv manus' if lang == 'sv' else 'Chat, summarize, or draft scripts'}<br>
-                    3) {'Exportera eller forts?tt granska' if lang == 'sv' else 'Export or keep investigating'}
+                    3) {'Exportera eller fortsätt granska' if lang == 'sv' else 'Export or keep investigating'}
                 </div>
             </div>
             """, unsafe_allow_html=True)
         if preview_source and preview_docs:
-            st.markdown("### " + ("Dokumentf?rhandsvisning" if lang == "sv" else "Document Preview"))
+            st.markdown("### " + ("Dokumentförhandsvisning" if lang == "sv" else "Document Preview"))
             page_options = [str(doc.metadata.get("page", "?")) for doc in preview_docs]
             selected_page = st.selectbox("Sida" if lang == "sv" else "Page", options=page_options, index=page_options.index(preview_page) if preview_page in page_options else 0)
             st.session_state.selected_preview_page = selected_page
@@ -1959,8 +1979,14 @@ def main():
     with tab_chat:
         st.markdown(f"### {get_text('chat_title')}")
         st.caption(get_text("chat_help"))
+        render_page_help(
+            "Om Chat" if lang == "sv" else "About Chat",
+            "Chatten söker i dina uppladdade dokument och försöker svara med källor. Använd källfilter om du vill begränsa svaret till vissa filer. Om appen varnar för dubbelkontroll betyder det att svaret eller källorna bör granskas manuellt."
+            if lang == "sv"
+            else "Chat searches your uploaded documents and tries to answer with citations. Use source filters to limit answers to certain files. If the app warns about verification, review the answer and citations manually.",
+        )
         if st.session_state.get("available_sources"):
-            st.multiselect("K?llfilter" if lang == "sv" else "Source filter", options=st.session_state.get("available_sources", []), key="chat_source_filter")
+            st.multiselect("Källfilter" if lang == "sv" else "Source filter", options=st.session_state.get("available_sources", []), key="chat_source_filter", help="Begränsa chatten till vissa dokument." if lang == "sv" else "Limit chat retrieval to selected documents.")
         for idx, msg in enumerate(st.session_state.chat_history):
             if msg["role"] == "user":
                 st.markdown(f'<div class="chat-message user-message">{msg["content"]}</div>', unsafe_allow_html=True)
@@ -1980,7 +2006,7 @@ def main():
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
             st.write(answer)
             if issues:
-                st.warning("Vissa delar av svaret beh?ver dubbelkontroll." if lang == "sv" else "Parts of the answer may need verification.")
+                st.warning("Vissa delar av svaret behöver dubbelkontroll." if lang == "sv" else "Parts of the answer may need verification.")
             if sources:
                 with st.expander(get_text("sources")):
                     for source_index, doc in enumerate(sources[:5]):
@@ -1996,6 +2022,12 @@ def main():
     with tab_summary:
         st.markdown(f"### {get_text('summarize_title')}")
         st.caption(get_text("summary_help"))
+        render_page_help(
+            "Om Sammanfatta" if lang == "sv" else "About Summary",
+            "Den här sidan skapar en längre sammanfattning av dina dokument. Du kan styra fokus, ton, längd och om sluttexten ska förfinas i ett extra steg. För stora dokument kan processen ta tid, särskilt första gången."
+            if lang == "sv"
+            else "This page creates a longer summary of your documents. You can control focus, tone, length, and whether the final text should be refined in an extra pass. Large document sets may take time, especially the first run.",
+        )
         if not st.session_state.docs:
             st.info(get_text("error_no_docs"))
         else:
@@ -2010,7 +2042,7 @@ def main():
                 target_words = int(target_pages * words_per_page)
                 st.caption(f"{get_text('summary_estimate')}: {target_words} {'ord' if lang=='sv' else 'words'}")
                 if target_words > 4000:
-                    st.warning("L?ngt sammanfattningsm?l. F?r hastighet kapas l?ngden vid 4000 ord." if lang == "sv" else "Long target length. For speed, output is capped at 4000 words.")
+                    st.warning("Långt sammanfattningsmål. För hastighet kapas längden vid 4000 ord." if lang == "sv" else "Long target length. For speed, output is capped at 4000 words.")
             if st.button(get_text("summarize_btn"), disabled=st.session_state.processing or st.session_state.summary_running, use_container_width=True):
                 st.session_state.summary_stage = "initializing"
                 st.session_state.summary_stages_log = []
@@ -2055,6 +2087,12 @@ def main():
     with tab_write:
         st.markdown(f"### {get_text('writing_title')}")
         st.caption(get_text("writing_help"))
+        render_page_help(
+            "Om Skrivstudio" if lang == "sv" else "About Writing Studio",
+            "Skrivstudio använder dina dokument som faktabas för att skapa utkast, manus, artiklar eller andra texter. Du väljer roll, format, ton och längd. Dokumentär-pipeline gör arbetet i flera steg: disposition, scenlista och slutligt manus."
+            if lang == "sv"
+            else "Writing Studio uses your documents as a factual base to create drafts, scripts, articles, and other text. You choose role, format, tone, and length. The documentary pipeline works in stages: outline, scene list, and final script.",
+        )
         brief = st.text_area(get_text("writing_brief"), placeholder=get_text("writing_placeholder"), height=140, key="writing_brief")
         col_a, col_b = st.columns(2)
         with col_a:
@@ -2066,7 +2104,7 @@ def main():
         use_sources = st.checkbox(get_text("writing_use_sources"), value=st.session_state.get("writing_use_sources", True), key="writing_use_sources")
         use_pipeline = st.checkbox(get_text("writing_pipeline"), value=st.session_state.get("writing_pipeline", False), key="writing_pipeline", help=get_text("writing_pipeline_help"))
         if st.session_state.get("available_sources"):
-            st.multiselect("K?llfilter" if lang == "sv" else "Source filter", options=st.session_state.get("available_sources", []), key="writing_source_filter")
+            st.multiselect("Källfilter" if lang == "sv" else "Source filter", options=st.session_state.get("available_sources", []), key="writing_source_filter", help="Begränsa skrivutkastet till vissa dokument." if lang == "sv" else "Limit the draft to selected documents.")
         if st.button(get_text("writing_generate"), disabled=st.session_state.processing or not brief):
             llm = load_llm(st.session_state.device_choice)
             result, used_sources = rag_generate_writing(brief, WRITING_ROLES[role_key]["sv" if lang == "sv" else "en"], WRITING_FORMATS[format_key]["sv" if lang == "sv" else "en"], WRITING_TONES[tone_key]["sv" if lang == "sv" else "en"], WRITING_LENGTHS[length_key]["words"], lang, st.session_state.vectorstore, llm, use_sources=use_sources, use_pipeline=use_pipeline, source_filter=st.session_state.get("writing_source_filter") or None)
@@ -2090,8 +2128,14 @@ def main():
 
     with tab_analysis:
         st.markdown(f"### {get_text('analysis_title')}")
+        render_page_help(
+            "Om Analys" if lang == "sv" else "About Analysis",
+            "Analysverktygen hjälper dig att snabbt hitta namn, organisationer, datum, nyckelord och enklare sentiment. De är till för översikt och researchstöd, inte som slutlig verifiering."
+            if lang == "sv"
+            else "Analysis tools help you quickly find names, organizations, dates, keywords, and basic sentiment. They are for overview and research support, not final verification.",
+        )
         if not st.session_state.docs:
-            st.warning("Ladda upp dokument f?rst." if lang == "sv" else "Please upload documents first.")
+            st.warning("Ladda upp dokument först." if lang == "sv" else "Please upload documents first.")
         else:
             ner_pipeline = load_ner_pipeline(st.session_state.device_choice)
             sent_pipeline = load_sentiment_pipeline(st.session_state.device_choice)
@@ -2124,8 +2168,14 @@ def main():
 
     with tab_export:
         st.markdown(f"### {get_text('export_title')}")
+        render_page_help(
+            "Om Export" if lang == "sv" else "About Export",
+            "Här kan du ladda ner sammanfattningen i flera format, köra en enkel partiskhetsgranskning eller översätta texten till ett annat språk."
+            if lang == "sv"
+            else "Here you can download the summary in several formats, run a simple bias review, or translate the text into another language.",
+        )
         if not st.session_state.last_summary:
-            st.info("Generera en sammanfattning f?rst." if lang == "sv" else "Generate a summary first.")
+            st.info("Generera en sammanfattning först." if lang == "sv" else "Generate a summary first.")
         else:
             text = st.session_state.last_summary
             col1, col2, col3, col4 = st.columns(4)

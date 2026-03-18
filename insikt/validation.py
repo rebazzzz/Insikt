@@ -6,6 +6,21 @@ import subprocess
 import torch
 
 
+def get_installed_ollama_models() -> list[str]:
+    try:
+        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=5, check=False)
+        if result.returncode != 0:
+            return []
+        models = []
+        for line in result.stdout.splitlines()[1:]:
+            parts = line.split()
+            if parts:
+                models.append(parts[0].strip())
+        return models
+    except Exception:
+        return []
+
+
 def run_startup_checks(llm_model: str, embedding_model: str) -> list[dict]:
     checks = []
     required_modules = [
@@ -26,11 +41,21 @@ def run_startup_checks(llm_model: str, embedding_model: str) -> list[dict]:
     checks.append({"name": "Python dependencies", "status": "ok" if not missing else "warning", "message": "All required packages detected." if not missing else f"Missing packages: {', '.join(missing)}"})
     checks.append({"name": "GPU readiness", "status": "ok" if torch.cuda.is_available() else "info", "message": "CUDA GPU available." if torch.cuda.is_available() else "CUDA GPU not detected. CPU mode will be used when needed."})
     try:
+        installed_models = get_installed_ollama_models()
+        output = "\n".join(installed_models)
         result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=5, check=False)
-        output = result.stdout + "\n" + result.stderr
         has_ollama = result.returncode == 0
         checks.append({"name": "Ollama", "status": "ok" if has_ollama else "warning", "message": "Ollama responded successfully." if has_ollama else "Ollama did not respond. Start it before using chat or summaries."})
-        checks.append({"name": "Selected LLM", "status": "ok" if llm_model in output else "warning", "message": f"Model '{llm_model}' detected." if llm_model in output else f"Model '{llm_model}' was not found in 'ollama list'."})
+        if llm_model in installed_models:
+            msg = f"Model '{llm_model}' detected."
+            status = "ok"
+        elif installed_models:
+            msg = f"Model '{llm_model}' was not found. Installed models: {', '.join(installed_models[:5])}."
+            status = "warning"
+        else:
+            msg = f"Model '{llm_model}' could not be verified."
+            status = "warning"
+        checks.append({"name": "Selected LLM", "status": status, "message": msg})
     except Exception:
         checks.append({"name": "Ollama", "status": "warning", "message": "Could not run 'ollama list'. Verify that Ollama is installed and on PATH."})
         checks.append({"name": "Selected LLM", "status": "info", "message": f"Could not verify model '{llm_model}' because Ollama was unavailable."})

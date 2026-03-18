@@ -1649,6 +1649,83 @@ def set_custom_css():
         color: var(--ink);
         border-bottom: 3px solid var(--accent);
     }
+    [data-testid="stPopover"] > button {
+        width: 2rem;
+        height: 2rem;
+        min-height: 2rem;
+        border-radius: 999px;
+        padding: 0;
+        background: #ffffff;
+        color: var(--accent-2);
+        border: 1px solid var(--border);
+        font-weight: 700;
+        box-shadow: none;
+    }
+    [data-testid="stPopover"] > button:hover {
+        background: #f8fafc;
+        transform: none;
+        box-shadow: 0 6px 16px rgba(15, 23, 42, 0.08);
+    }
+    div[data-baseweb="popover"] {
+        max-width: 420px !important;
+    }
+    .help-block-title {
+        font-size: 0.85rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--accent-2);
+        margin-bottom: 0.4rem;
+    }
+    .chat-shell {
+        background: rgba(255,255,255,0.62);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 1rem;
+        box-shadow: var(--shadow);
+    }
+    [data-testid="stChatMessage"] {
+        max-width: 860px;
+        margin-left: auto;
+        margin-right: auto;
+        padding-top: 0.35rem;
+        padding-bottom: 0.35rem;
+    }
+    [data-testid="stChatMessageContent"] {
+        border-radius: 18px;
+        padding: 1rem 1.15rem;
+        line-height: 1.65;
+    }
+    [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) [data-testid="stChatMessageContent"] {
+        background: #e6fffb;
+        border: 1px solid #99f6e4;
+    }
+    [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) [data-testid="stChatMessageContent"] {
+        background: #fffaf5;
+        border: 1px solid var(--border);
+    }
+    .chat-notes {
+        margin-top: 0.8rem;
+        padding: 0.75rem 0.9rem;
+        border-radius: 12px;
+        background: #fff7ed;
+        border: 1px solid #fdba74;
+    }
+    .chat-sources {
+        margin-top: 0.8rem;
+        border-top: 1px solid var(--border);
+        padding-top: 0.8rem;
+    }
+    .citation-register {
+        margin-top: 0.8rem;
+        padding: 0.85rem 1rem;
+        background: #f8fafc;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+    }
+    .citation-register strong {
+        display: block;
+        margin-bottom: 0.45rem;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1752,9 +1829,75 @@ def copy_block(text: str, key: str):
     )
 
 
-def render_page_help(title: str, body: str):
-    with st.expander(f"? {title}", expanded=False):
-        st.write(body)
+def render_page_header(title: str, caption: str, help_title: str, help_body: str):
+    title_col, help_col = st.columns([20, 1])
+    with title_col:
+        st.markdown(f"### {title}")
+    with help_col:
+        with st.popover("i", help=help_title):
+            st.markdown(f"**{help_title}**")
+            st.markdown(help_body)
+    if caption:
+        st.caption(caption)
+
+
+def split_assistant_content(content: str):
+    parts = [part.strip() for part in content.split("\n\n") if part.strip()]
+    body_parts = []
+    notes = []
+    for part in parts:
+        if part.startswith("Obs:") or part.startswith("OBS:") or part.startswith("Note:"):
+            notes.append(part)
+        else:
+            body_parts.append(part)
+    return "\n\n".join(body_parts).strip(), notes
+
+
+def prettify_citations_for_display(text: str, lang: str):
+    pattern = r"\[(Källa|Source):\s*([^,\]]+),\s*(sida|page)\s*([^\]]+)\]"
+    source_order = []
+    source_map = {}
+
+    def replacer(match):
+        source = match.group(2).strip()
+        page = match.group(4).strip()
+        key = (source, page)
+        if key not in source_map:
+            source_map[key] = len(source_order) + 1
+            source_order.append(key)
+        return f"[{source_map[key]}]"
+
+    cleaned = re.sub(pattern, replacer, text, flags=re.IGNORECASE)
+    register = []
+    for source, page in source_order:
+        label = f"[{source_map[(source, page)]}] {source}, {'sida' if lang == 'sv' else 'page'} {page}"
+        register.append(label)
+    return cleaned, register
+
+
+def render_citation_register(register: list[str], lang: str):
+    if not register:
+        return
+    st.markdown('<div class="citation-register">', unsafe_allow_html=True)
+    st.markdown("**Källregister**" if lang == "sv" else "**Citation Register**")
+    for item in register:
+        st.markdown(f"- {item}")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_source_snippets(sources, lang: str, key_prefix: str):
+    if not sources:
+        return
+    with st.expander("Visa källutdrag" if lang == "sv" else "Show source excerpts", expanded=False):
+        for source_index, doc in enumerate(sources[:5]):
+            src = doc.metadata.get("source", "Unknown")
+            page = doc.metadata.get("page", "?")
+            label = f"s.{page}" if lang == "sv" else f"p.{page}"
+            st.markdown(f'<div class="source-box"><b>{src}</b> ({label})<br>{doc.page_content[:220]}...</div>', unsafe_allow_html=True)
+            if st.button("Visa källa" if lang == "sv" else "Open source", key=f"{key_prefix}-source-{source_index}"):
+                st.session_state.selected_preview_source = src
+                st.session_state.selected_preview_page = str(page)
+                st.rerun()
 
 
 def get_llm_option_info(model_key: str) -> dict:
@@ -2051,26 +2194,55 @@ def main():
     tab_chat, tab_summary, tab_write, tab_analysis, tab_export = st.tabs(["Chat", "Sammanfatta" if lang == "sv" else "Summary", "Skrivstudio" if lang == "sv" else "Writing Studio", "Analys" if lang == "sv" else "Analysis", "Export"])
 
     with tab_chat:
-        st.markdown(f"### {get_text('chat_title')}")
-        st.caption(get_text("chat_help"))
-        render_page_help(
+        render_page_header(
+            get_text("chat_title"),
+            get_text("chat_help"),
             "Om Chat" if lang == "sv" else "About Chat",
-            "Chatten söker i dina uppladdade dokument och försöker svara med källor. Använd källfilter om du vill begränsa svaret till vissa filer. Om appen varnar för dubbelkontroll betyder det att svaret eller källorna bör granskas manuellt."
+            (
+                "### Vad den gör\n"
+                "- Söker i dina uppladdade dokument.\n"
+                "- Försöker svara med källor när underlaget räcker.\n"
+                "- Visar varningar om något bör granskas manuellt.\n\n"
+                "### Bra att veta\n"
+                "- Använd källfilter om du vill begränsa svaret till vissa filer.\n"
+                "- Om svaret saknar tydliga källor bör du kontrollera originaldokumentet."
+            )
             if lang == "sv"
-            else "Chat searches your uploaded documents and tries to answer with citations. Use source filters to limit answers to certain files. If the app warns about verification, review the answer and citations manually.",
+            else
+            (
+                "### What it does\n"
+                "- Searches your uploaded documents.\n"
+                "- Tries to answer with citations when the material is sufficient.\n"
+                "- Shows warnings when something should be reviewed manually.\n\n"
+                "### Good to know\n"
+                "- Use source filters to limit answers to certain files.\n"
+                "- If the answer lacks clear citations, check the original document."
+            ),
         )
         if st.session_state.get("available_sources"):
             st.multiselect("Källfilter" if lang == "sv" else "Source filter", options=st.session_state.get("available_sources", []), key="chat_source_filter", help="Begränsa chatten till vissa dokument." if lang == "sv" else "Limit chat retrieval to selected documents.")
+        st.markdown('<div class="chat-shell">', unsafe_allow_html=True)
         for idx, msg in enumerate(st.session_state.chat_history):
             if msg["role"] == "user":
-                st.markdown(f'<div class="chat-message user-message">{msg["content"]}</div>', unsafe_allow_html=True)
+                with st.chat_message("user"):
+                    st.markdown(msg["content"])
             else:
-                st.markdown(f'<div class="chat-message assistant-message">{msg["content"]}</div>', unsafe_allow_html=True)
-                tools_left, tools_right = st.columns(2)
-                with tools_left:
-                    copy_block(msg["content"], key=f"copy-{idx}")
-                with tools_right:
-                    st.download_button("Ladda ner svar" if lang == "sv" else "Download answer", data=msg["content"].encode("utf-8"), file_name=f"insikt-answer-{idx + 1}.txt", mime="text/plain", key=f"download-answer-{idx}")
+                body, notes = split_assistant_content(msg["content"])
+                body, register = prettify_citations_for_display(body or msg["content"], lang)
+                with st.chat_message("assistant"):
+                    st.markdown(body)
+                    tools_left, tools_right = st.columns([1, 1])
+                    with tools_left:
+                        copy_block(msg["content"], key=f"copy-{idx}")
+                    with tools_right:
+                        st.download_button("Ladda ner svar" if lang == "sv" else "Download answer", data=msg["content"].encode("utf-8"), file_name=f"insikt-answer-{idx + 1}.txt", mime="text/plain", key=f"download-answer-{idx}")
+                    render_citation_register(register, lang)
+                    if notes:
+                        st.markdown('<div class="chat-notes">', unsafe_allow_html=True)
+                        st.markdown("**Att kontrollera**" if lang == "sv" else "**Check these notes**")
+                        for note in notes:
+                            st.markdown(f"- {note}")
+                        st.markdown("</div>", unsafe_allow_html=True)
         if prompt := st.chat_input(get_text("chat_input"), disabled=st.session_state.processing):
             st.session_state.chat_history.append({"role": "user", "content": prompt})
             with st.spinner("Tänker..." if lang == "sv" else "Thinking..."):
@@ -2078,29 +2250,52 @@ def main():
                 history_lc = [HumanMessage(content=m["content"]) if m["role"] == "user" else AIMessage(content=m["content"]) for m in st.session_state.chat_history[:-1]]
                 answer, sources, issues = rag_chat_with_docs(prompt, history_lc, st.session_state.vectorstore, llm, st.session_state.lang, source_filter=st.session_state.get("chat_source_filter") or None)
             st.session_state.chat_history.append({"role": "assistant", "content": answer})
-            st.write(answer)
-            if issues:
-                st.warning("Vissa delar av svaret behöver dubbelkontroll." if lang == "sv" else "Parts of the answer may need verification.")
-            if sources:
-                with st.expander(get_text("sources")):
-                    for source_index, doc in enumerate(sources[:5]):
-                        src = doc.metadata.get("source", "Unknown")
-                        page = doc.metadata.get("page", "?")
-                        label = f"s.{page}" if lang == "sv" else f"p.{page}"
-                        st.markdown(f'<div class="source-box"><b>{src}</b> ({label})<br>{doc.page_content[:200]}...</div>', unsafe_allow_html=True)
-                        if st.button("Visa källa" if lang == "sv" else "Open source", key=f"open-source-chat-{source_index}"):
-                            st.session_state.selected_preview_source = src
-                            st.session_state.selected_preview_page = str(page)
-                            st.rerun()
+            body, notes = split_assistant_content(answer)
+            body, register = prettify_citations_for_display(body or answer, lang)
+            with st.chat_message("assistant"):
+                st.markdown(body)
+                tools_left, tools_right = st.columns([1, 1])
+                with tools_left:
+                    copy_block(answer, key="copy-latest")
+                with tools_right:
+                    st.download_button("Ladda ner svar" if lang == "sv" else "Download answer", data=answer.encode("utf-8"), file_name="insikt-answer-latest.txt", mime="text/plain", key="download-answer-latest")
+                render_citation_register(register, lang)
+                if notes or issues:
+                    st.markdown('<div class="chat-notes">', unsafe_allow_html=True)
+                    st.markdown("**Att kontrollera**" if lang == "sv" else "**Check these notes**")
+                    for note in notes:
+                        st.markdown(f"- {note}")
+                    if issues:
+                        st.markdown("- " + ("Vissa delar av svaret behöver dubbelkontroll." if lang == "sv" else "Parts of the answer may need verification."))
+                    st.markdown("</div>", unsafe_allow_html=True)
+                render_source_snippets(sources, lang, "chat-latest")
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with tab_summary:
-        st.markdown(f"### {get_text('summarize_title')}")
-        st.caption(get_text("summary_help"))
-        render_page_help(
+        render_page_header(
+            get_text("summarize_title"),
+            get_text("summary_help"),
             "Om Sammanfatta" if lang == "sv" else "About Summary",
-            "Den här sidan skapar en längre sammanfattning av dina dokument. Du kan styra fokus, ton, längd och om sluttexten ska förfinas i ett extra steg. För stora dokument kan processen ta tid, särskilt första gången."
+            (
+                "### Vad den gör\n"
+                "- Skapar en längre sammanfattning av dina dokument.\n"
+                "- Låter dig styra fokus, ton och längd.\n"
+                "- Kan förfina sluttexten i ett extra steg.\n\n"
+                "### Bra att veta\n"
+                "- För stora dokument kan första körningen ta tid.\n"
+                "- Längre måltext kan kapas för att hålla svaren stabila."
+            )
             if lang == "sv"
-            else "This page creates a longer summary of your documents. You can control focus, tone, length, and whether the final text should be refined in an extra pass. Large document sets may take time, especially the first run.",
+            else
+            (
+                "### What it does\n"
+                "- Creates a longer summary of your documents.\n"
+                "- Lets you control focus, tone, and length.\n"
+                "- Can refine the final text in an extra step.\n\n"
+                "### Good to know\n"
+                "- Large document sets may take time on the first run.\n"
+                "- Very long targets may be capped to keep output stable."
+            ),
         )
         if not st.session_state.docs:
             st.info(get_text("error_no_docs"))
@@ -2153,19 +2348,38 @@ def main():
                 st.markdown(f'<div class="warning-box">{"Fel: " if lang=="sv" else "Error: "}{error_msg}</div>', unsafe_allow_html=True)
         elif st.session_state.summary_result:
             st.markdown("### " + ("Sammanfattning" if lang == "sv" else "Summary"))
-            st.write(st.session_state.summary_result)
+            summary_body, summary_register = prettify_citations_for_display(st.session_state.summary_result, lang)
+            st.markdown(summary_body)
+            render_citation_register(summary_register, lang)
             st.session_state.last_summary = st.session_state.summary_result
             st.success(get_text("success_summary"))
             st.download_button("Ladda ner sammanfattning" if lang == "sv" else "Download summary", data=st.session_state.summary_result.encode("utf-8"), file_name="insikt-summary.txt", mime="text/plain")
 
     with tab_write:
-        st.markdown(f"### {get_text('writing_title')}")
-        st.caption(get_text("writing_help"))
-        render_page_help(
+        render_page_header(
+            get_text("writing_title"),
+            get_text("writing_help"),
             "Om Skrivstudio" if lang == "sv" else "About Writing Studio",
-            "Skrivstudio använder dina dokument som faktabas för att skapa utkast, manus, artiklar eller andra texter. Du väljer roll, format, ton och längd. Dokumentär-pipeline gör arbetet i flera steg: disposition, scenlista och slutligt manus."
+            (
+                "### Vad den gör\n"
+                "- Använder dina dokument som faktabas för att skriva utkast.\n"
+                "- Du väljer roll, format, ton och längd.\n"
+                "- Kan skapa artikel, manus eller dokumentärupplägg.\n\n"
+                "### Bra att veta\n"
+                "- Dokumentär-pipeline kör i flera steg: disposition, scenlista och slutligt manus.\n"
+                "- Källfilter hjälper dig hålla texten till rätt dokument."
+            )
             if lang == "sv"
-            else "Writing Studio uses your documents as a factual base to create drafts, scripts, articles, and other text. You choose role, format, tone, and length. The documentary pipeline works in stages: outline, scene list, and final script.",
+            else
+            (
+                "### What it does\n"
+                "- Uses your documents as a factual base for drafting.\n"
+                "- Lets you choose role, format, tone, and length.\n"
+                "- Can create articles, scripts, or documentary-style drafts.\n\n"
+                "### Good to know\n"
+                "- The documentary pipeline runs in stages: outline, scene list, and final script.\n"
+                "- Source filters help keep the draft tied to the right documents."
+            ),
         )
         brief = st.text_area(get_text("writing_brief"), placeholder=get_text("writing_placeholder"), height=140, key="writing_brief")
         col_a, col_b = st.columns(2)
@@ -2186,27 +2400,35 @@ def main():
             st.session_state.writing_sources = used_sources
         if st.session_state.get("writing_result"):
             st.markdown("### " + get_text("writing_result"))
-            st.write(st.session_state.writing_result)
+            writing_body, writing_register = prettify_citations_for_display(st.session_state.writing_result, lang)
+            st.markdown(writing_body)
+            render_citation_register(writing_register, lang)
             sources = st.session_state.get("writing_sources", [])
-            if sources:
-                with st.expander(get_text("writing_sources")):
-                    for doc in sources[:5]:
-                        src = doc.metadata.get("source", "Unknown")
-                        page = doc.metadata.get("page", "?")
-                        label = f"s.{page}" if lang == "sv" else f"p.{page}"
-                        st.markdown(f'<div class="source-box"><b>{src}</b> ({label})<br>{doc.page_content[:200]}...</div>', unsafe_allow_html=True)
-                        if st.button("Visa källa" if lang == "sv" else "Open source", key=f"open-source-write-{src}-{page}"):
-                            st.session_state.selected_preview_source = src
-                            st.session_state.selected_preview_page = str(page)
-                            st.rerun()
+            render_source_snippets(sources, lang, "writing")
 
     with tab_analysis:
-        st.markdown(f"### {get_text('analysis_title')}")
-        render_page_help(
+        render_page_header(
+            get_text("analysis_title"),
+            "",
             "Om Analys" if lang == "sv" else "About Analysis",
-            "Analysverktygen hjälper dig att snabbt hitta namn, organisationer, datum, nyckelord och enklare sentiment. De är till för översikt och researchstöd, inte som slutlig verifiering."
+            (
+                "### Vad den gör\n"
+                "- Hjälper dig hitta namn, organisationer och platser.\n"
+                "- Tar fram datum, nyckelord och enklare sentiment.\n\n"
+                "### Bra att veta\n"
+                "- Resultaten är till för översikt och researchstöd.\n"
+                "- Dubbelkolla alltid viktiga slutsatser i originalkällan."
+            )
             if lang == "sv"
-            else "Analysis tools help you quickly find names, organizations, dates, keywords, and basic sentiment. They are for overview and research support, not final verification.",
+            else
+            (
+                "### What it does\n"
+                "- Helps you find names, organizations, and places.\n"
+                "- Pulls out dates, keywords, and basic sentiment.\n\n"
+                "### Good to know\n"
+                "- Results are for overview and research support.\n"
+                "- Always verify important conclusions in the original source."
+            ),
         )
         if not st.session_state.docs:
             st.warning("Ladda upp dokument först." if lang == "sv" else "Please upload documents first.")
@@ -2241,12 +2463,30 @@ def main():
                     st.write(f"Sentiment: **{result['label']}** (konfidens: {result['score']:.2f})" if lang == "sv" else f"Sentiment: **{result['label']}** (confidence: {result['score']:.2f})")
 
     with tab_export:
-        st.markdown(f"### {get_text('export_title')}")
-        render_page_help(
+        render_page_header(
+            get_text("export_title"),
+            "",
             "Om Export" if lang == "sv" else "About Export",
-            "Här kan du ladda ner sammanfattningen i flera format, köra en enkel partiskhetsgranskning eller översätta texten till ett annat språk."
+            (
+                "### Vad den gör\n"
+                "- Låter dig ladda ner sammanfattningen i flera format.\n"
+                "- Kan köra en enkel partiskhetsgranskning.\n"
+                "- Kan översätta texten till andra språk.\n\n"
+                "### Bra att veta\n"
+                "- Export bygger på den senaste sammanfattningen du har skapat.\n"
+                "- Kontrollera gärna texten innan du delar den vidare."
+            )
             if lang == "sv"
-            else "Here you can download the summary in several formats, run a simple bias review, or translate the text into another language.",
+            else
+            (
+                "### What it does\n"
+                "- Lets you download the summary in multiple formats.\n"
+                "- Can run a simple bias review.\n"
+                "- Can translate the text into other languages.\n\n"
+                "### Good to know\n"
+                "- Export uses the latest summary you have generated.\n"
+                "- It is still worth reviewing the text before sharing it."
+            ),
         )
         if not st.session_state.last_summary:
             st.info("Generera en sammanfattning först." if lang == "sv" else "Generate a summary first.")

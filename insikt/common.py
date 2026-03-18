@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import hashlib
 import json
 import re
@@ -46,6 +47,11 @@ def strip_emoji(text: str) -> str:
 
 def cleaned_ui_text(text: str) -> str:
     return strip_emoji(normalize_text(text))
+
+
+def safe_html_fragment(text: str) -> str:
+    escaped = html.escape(text or "")
+    return escaped.replace("\n", "<br>")
 
 
 def docs_to_records(docs: Sequence[Document]) -> List[dict]:

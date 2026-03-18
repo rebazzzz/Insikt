@@ -1,52 +1,80 @@
-# TODO: UX Improvements for Summarization Progress
+# Insikt Product Roadmap
 
-## Phase 1: Enhanced Progress Tracking ✅ COMPLETED
+This file tracks the next high-impact product work for Insikt.
 
-- [x] 1. Add detailed stage constants (reading, processing, combining, polishing)
-- [x] 2. Add session state variables for stage tracking
-- [x] 3. Modify SummaryThread to track detailed stages
-- [x] 4. Add progress callback with stage information
+## Current Priorities
 
-## Phase 2: UI Improvements ✅ COMPLETED
+- [x] One-click onboarding
+  First-run setup wizard that checks Ollama, installed models, and local dependencies, then offers automatic fixes for common issues.
+- [x] Auto model recommendations
+  Suggest `Fast`, `Balanced`, and `Best quality` based on the actual laptop while still allowing manual model selection.
+- [x] OCR and scanned PDF support
+  Add robust OCR so scanned source material works in the same workflow as text PDFs.
+- [x] Clickable inline citations
+  Keep the citation register, but also make citations inside the generated text directly clickable.
+- [x] Document navigator
+  Add a left-side source panel with filename, page navigation, bookmarks, and highlighted cited passages.
+- [x] Better session browser
+  Replace simple save names with thumbnails, timestamps, tags, and case folders.
+- [x] Accessibility and simplicity
+  Introduce larger controls, plainer wording, fewer technical labels, and a `basic mode` for non-technical users.
 
-- [x] 5. Create detailed stage progress bar (multiple indicators)
-- [x] 6. Add expandable status log container
-- [x] 7. Show percentage completion and stage description
-- [x] 8. Add cancel button for long-running operations
-- [x] 9. Clear success/error states with helpful messages
-- [x] 10. Better processing messages throughout
+## Reporter Workflow
 
-## Implementation Summary:
+- [x] Reporter workflow templates
+  Add presets such as `summarize interview`, `build timeline`, `find contradictions`, `extract names and roles`, and `write article draft`.
+- [x] Quote extraction
+  Pull exact quote candidates with page references so reporters can move faster from source review to drafting.
+- [x] Source comparison mode
+  Compare what multiple documents say about the same person, event, or claim.
+- [x] Claim checker
+  Highlight statements in a generated draft that still need verification before publication.
+- [x] Case board
+  Create a shared workspace for notes, pinned excerpts, important people, dates, and draft angles.
 
-### New Session State Variables:
+## Trust, Review, And Export
 
-- `summary_stage` - Current stage (idle, initializing, processing, combining, polishing, complete, error, cancelled)
-- `summary_stages_log` - List of all stage changes with timestamps
-- `summary_current_batch` - Current batch being processed
-- `summary_total_batches` - Total number of batches
-- `summary_percentage` - Overall percentage complete
-- `summary_cancel_requested` - Flag for cancel request
+- [x] Answer confidence mode
+  Show plain-language evidence signals such as `well-supported`, `partly supported`, or `needs review`.
+- [x] Safer exports
+  Export with automatic footnotes or endnotes plus a source appendix.
 
-### Enhanced UI Features:
+## Performance And Scale
 
-- Stage indicator pills showing current stage with icons (⚪🔄📝🔗✨✅❌⏹️)
-- 4-column stage progress showing all stages (Processing → Combining → Polishing → Complete)
-- Expandable detailed log showing last 10 progress entries
-- Overall percentage display with progress bar
-- Cancel button to stop long-running operations
-- Clear error/cancelled states with helpful messages
-- Success messages showing completion time
+- [x] Large-document performance mode
+  Add a background indexing queue, cache visibility, and smarter incremental updates when only one file changes.
 
-### Stage Messages (Bilingual):
+## Suggested Delivery Order
 
-- "Initierar sammanfattningsprocess..." / "Initializing summarization process..."
-- "Sammanfattar avsnitt X av Y..." / "Summarizing section X of Y..."
-- "Kombinerar sammanfattning X av Y..." / "Combining summary X of Y..."
-- "Färdigställer slutlig sammanfattning..." / "Finalizing summary..."
-- "Slutfört! Sammanfattning genererad på Xs" / "Complete! Summary generated in Xs"
+### Phase 1: Friction Removal
 
-## Notes:
+- [x] One-click onboarding
+- [x] Auto model recommendations
+- [x] Accessibility and simplicity
+- [x] Better session browser
 
-- The SummaryThread now has proper indentation and is fully functional
-- The progress callback is being called with detailed stage information
-- The UI properly displays all progress stages with icons and percentage
+### Phase 2: Source Trust And Navigation
+
+- [x] Clickable inline citations
+- [x] Document navigator
+- [x] Answer confidence mode
+- [x] Safer exports
+
+### Phase 3: Reporter Workflows
+
+- [x] Reporter workflow templates
+- [x] Quote extraction
+- [x] Source comparison mode
+- [x] Claim checker
+- [x] Case board
+
+### Phase 4: Heavy-Duty Document Support
+
+- [x] OCR and scanned PDF support
+- [x] Large-document performance mode
+
+## Notes
+
+- Inline citation clicks and the document navigator should be designed together so the cited passage opens in context.
+- OCR support should plug into the same citation and page-reference model used for native PDFs.
+- Confidence labels should be evidence-based and phrased for newsroom use, not as model probability jargon.

@@ -3,7 +3,7 @@ import unittest
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
 
-from insikt.rag import create_chat_prompt, extract_citations_from_response, rerank_documents, verify_citations
+from insikt.rag import assess_answer_confidence, create_chat_prompt, extract_citations_from_response, rerank_documents, verify_citations
 
 
 class RagTests(unittest.TestCase):
@@ -28,6 +28,24 @@ class RagTests(unittest.TestCase):
         ]
         ranked = rerank_documents("budget corruption", docs, limit=1)
         self.assertEqual(ranked[0].metadata["source"], "b")
+
+    def test_confidence_well_supported_for_multiple_verified_citations(self):
+        docs = [
+            Document(page_content="Budget fraud details", metadata={"source": "report.pdf", "page": "2"}),
+            Document(page_content="Witness statement", metadata={"source": "notes.pdf", "page": "5"}),
+        ]
+        result = assess_answer_confidence(
+            "Claim [Source: report.pdf, page 2] and corroboration [Source: notes.pdf, page 5]",
+            docs,
+            [],
+            "en",
+        )
+        self.assertEqual(result["level"], "well_supported")
+
+    def test_confidence_needs_review_without_citations(self):
+        docs = [Document(page_content="Budget fraud details", metadata={"source": "report.pdf", "page": "2"})]
+        result = assess_answer_confidence("Claim without support", docs, ["missing_citations"], "en")
+        self.assertEqual(result["level"], "needs_review")
 
 
 if __name__ == "__main__":

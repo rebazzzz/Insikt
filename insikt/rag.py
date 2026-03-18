@@ -170,6 +170,43 @@ def verify_citations(response: str, context_docs: Sequence[Document], lang: str)
     return response, issues
 
 
+def assess_answer_confidence(response: str, context_docs: Sequence[Document], issues: Sequence[str] | None, lang: str) -> dict:
+    issues = list(issues or [])
+    citations = extract_citations_from_response(response)
+    unique_citations = {(item["source"], item["page"]) for item in citations}
+    source_count = len({doc.metadata.get("source", "Unknown") for doc in context_docs}) if context_docs else 0
+    severe_issue_prefixes = ("generation_error", "missing_citations", "unknown_source", "unknown_page")
+    has_severe_issue = any(issue.startswith(severe_issue_prefixes) for issue in issues)
+    has_grounding_issue = any(issue.startswith("weak_grounding") for issue in issues)
+
+    if has_severe_issue or not context_docs:
+        return {
+            "level": "needs_review",
+            "label": "Behöver granskas" if lang == "sv" else "Needs review",
+            "reason": "Svaret saknar tillräckligt tydligt eller verifierat dokumentstöd." if lang == "sv" else "The answer lacks sufficiently clear or verified document support.",
+            "citation_count": len(unique_citations),
+            "source_count": source_count,
+            "issues": issues,
+        }
+    if has_grounding_issue or len(unique_citations) == 1 or source_count == 1:
+        return {
+            "level": "partly_supported",
+            "label": "Delvis styrkt" if lang == "sv" else "Partly supported",
+            "reason": "Delar av svaret stöds, men underlaget är begränsat eller bör dubbelkollas." if lang == "sv" else "Parts of the answer are supported, but the evidence is limited or should be double-checked.",
+            "citation_count": len(unique_citations),
+            "source_count": source_count,
+            "issues": issues,
+        }
+    return {
+        "level": "well_supported",
+        "label": "Väl underbyggt" if lang == "sv" else "Well-supported",
+        "reason": "Svaret har flera verifierbara hänvisningar och tydligt stöd i dokumenten." if lang == "sv" else "The answer has multiple verifiable references and clear support in the documents.",
+        "citation_count": len(unique_citations),
+        "source_count": source_count,
+        "issues": issues,
+    }
+
+
 def grounding_check(response: str, context_docs: Sequence[Document], lang: str) -> Tuple[str, list]:
     if not context_docs:
         return response, []

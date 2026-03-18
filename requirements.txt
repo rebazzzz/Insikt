@@ -14,3 +14,6 @@ markdown
 yake
 sentence-transformers
 numpy
+pytesseract
+pypdfium2
+Pillow

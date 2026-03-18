@@ -12,8 +12,10 @@ import pickle
 import re
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from urllib.parse import quote
 import streamlit as st
 from streamlit.runtime.uploaded_file_manager import UploadedFile
 import streamlit.components.v1 as components
@@ -42,17 +44,24 @@ from fpdf import FPDF
 from transformers import pipeline
 import yake
 
-from insikt.analysis import analyze_sentiment, bias_check, extract_entities, extract_keywords, extract_timeline, translate_text
-from insikt.common import cleaned_ui_text, docs_to_records, records_to_docs
+from insikt.analysis import analyze_sentiment, bias_check, compare_sources, extract_claim_check_items, extract_entities, extract_keywords, extract_quote_candidates, extract_timeline, translate_text
+from insikt.common import cleaned_ui_text, docs_to_records, records_to_docs, safe_html_fragment
 from insikt.exports import export_docx, export_markdown, export_pdf, export_text
-from insikt.pipeline import build_or_load_vectorstore, process_uploaded_files as cached_process_uploaded_files, rechunk_pages
+from insikt.pipeline import build_or_load_vectorstore, get_cache_stats, process_uploaded_files as cached_process_uploaded_files, rechunk_pages
 from insikt.rag import chat_with_docs as rag_chat_with_docs
 from insikt.rag import generate_writing as rag_generate_writing
+from insikt.rag import assess_answer_confidence
 from insikt.session_store import delete_slot, list_save_slots, load_slot, save_slot
 from insikt.summarization import SummaryThread as ModularSummaryThread
 from insikt.summarization import generate_doc_hash as modular_generate_doc_hash
 from insikt.ui import app_readiness_label, concise_model_label
-from insikt.validation import get_installed_ollama_models, resolve_installed_ollama_model, run_startup_checks
+from insikt.validation import (
+    get_installed_ollama_models,
+    get_model_recommendations,
+    get_system_profile,
+    resolve_installed_ollama_model,
+    run_startup_checks,
+)
 
 # -------------------------------------------------------------------
 # Configuration & Language
@@ -179,6 +188,94 @@ WRITING_LENGTHS = {
     "short": {"sv": "Kort", "en": "Short", "words": 400},
     "medium": {"sv": "Medel", "en": "Medium", "words": 800},
     "long": {"sv": "Lång", "en": "Long", "words": 1500},
+}
+
+REPORTER_TEMPLATES = {
+    "summarize_interview": {
+        "title": {"sv": "Sammanfatta intervju", "en": "Summarize interview"},
+        "summary_focus": {
+            "sv": "Sammanfatta intervjun tydligt. Lyft fram huvudpåståenden, viktiga citat, vem som säger vad, osäkerheter och konkreta uppföljningsfrågor.",
+            "en": "Summarize the interview clearly. Highlight the main claims, important quotes, who says what, uncertainties, and concrete follow-up questions.",
+        },
+        "summary_style": "neutral",
+        "summary_target_pages": 4,
+        "summary_words_per_page": 260,
+        "writing_brief": {
+            "sv": "Skriv en kort intervjusammanfattning med huvudpunkter, citat att dubbelkolla och möjliga vinklar för uppföljning.",
+            "en": "Write a short interview summary with key points, quotes to verify, and possible follow-up angles.",
+        },
+        "writing_format": "article",
+        "writing_tone": "neutral",
+        "writing_length": "medium",
+    },
+    "build_timeline": {
+        "title": {"sv": "Bygg tidslinje", "en": "Build timeline"},
+        "summary_focus": {
+            "sv": "Ordna materialet kronologiskt. Fokusera på datum, händelser, aktörer, vad som förändras över tid och luckor i tidslinjen.",
+            "en": "Arrange the material chronologically. Focus on dates, events, actors, what changes over time, and gaps in the timeline.",
+        },
+        "summary_style": "formal",
+        "summary_target_pages": 3,
+        "summary_words_per_page": 240,
+        "writing_brief": {
+            "sv": "Bygg en kronologisk tidslinje med datum, händelse, källa och vad som fortfarande behöver bekräftas.",
+            "en": "Build a chronological timeline with date, event, source, and what still needs confirmation.",
+        },
+        "writing_format": "article",
+        "writing_tone": "formal",
+        "writing_length": "medium",
+    },
+    "find_contradictions": {
+        "title": {"sv": "Hitta motsägelser", "en": "Find contradictions"},
+        "summary_focus": {
+            "sv": "Leta efter motsägelser mellan dokument, olika versioner av samma händelse, avvikande siffror och påståenden som inte går ihop.",
+            "en": "Look for contradictions between documents, conflicting versions of the same event, inconsistent figures, and claims that do not line up.",
+        },
+        "summary_style": "investigative",
+        "summary_target_pages": 4,
+        "summary_words_per_page": 260,
+        "writing_brief": {
+            "sv": "Lista dokumenterade motsägelser, vilka källor som krockar och vilka frågor som bör ställas för att reda ut skillnaderna.",
+            "en": "List documented contradictions, which sources conflict, and which questions should be asked to resolve the differences.",
+        },
+        "writing_format": "article",
+        "writing_tone": "investigative",
+        "writing_length": "medium",
+    },
+    "extract_names_roles": {
+        "title": {"sv": "Namn och roller", "en": "Extract names and roles"},
+        "summary_focus": {
+            "sv": "Identifiera personer, organisationer, titlar, ansvar och relationer mellan aktörerna i materialet.",
+            "en": "Identify people, organizations, titles, responsibilities, and relationships between the actors in the material.",
+        },
+        "summary_style": "neutral",
+        "summary_target_pages": 2,
+        "summary_words_per_page": 220,
+        "writing_brief": {
+            "sv": "Skapa en översikt över namn, roller, organisationer och hur de hänger ihop.",
+            "en": "Create an overview of names, roles, organizations, and how they connect.",
+        },
+        "writing_format": "article",
+        "writing_tone": "formal",
+        "writing_length": "short",
+    },
+    "write_article_draft": {
+        "title": {"sv": "Skriv artikelutkast", "en": "Write article draft"},
+        "summary_focus": {
+            "sv": "Lyft fram de viktigaste nyhetsvärdena, kärnpåståendena, vad som är dokumenterat och vilka delar som behöver ytterligare verifiering.",
+            "en": "Highlight the strongest news value, core claims, what is documented, and which parts need more verification.",
+        },
+        "summary_style": "investigative",
+        "summary_target_pages": 5,
+        "summary_words_per_page": 280,
+        "writing_brief": {
+            "sv": "Skriv ett artikelutkast med tydlig ingress, bakgrund, centrala belägg, relevanta citat och en avslutande lista över sådant som måste verifieras innan publicering.",
+            "en": "Write an article draft with a clear lede, background, core evidence, relevant quotes, and a closing list of what must be verified before publication.",
+        },
+        "writing_format": "article",
+        "writing_tone": "investigative",
+        "writing_length": "long",
+    },
 }
 
 LANGUAGES = {
@@ -1480,8 +1577,12 @@ def export_markdown(text): return text.encode()
 # -------------------------------------------------------------------
 # UI Custom CSS (unchanged)
 # -------------------------------------------------------------------
-def set_custom_css():
-    st.markdown("""
+def set_custom_css(basic_mode: bool = False):
+    base_font = "1.04rem" if basic_mode else "0.98rem"
+    button_padding = "0.8rem 1.1rem" if basic_mode else "0.55rem 1.1rem"
+    button_font = "1rem" if basic_mode else "0.95rem"
+    input_font = "1rem" if basic_mode else "0.95rem"
+    st.markdown(f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:wght@500;600&display=swap');
     :root {
@@ -1495,7 +1596,10 @@ def set_custom_css():
         --border: #e5e7eb;
         --shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
     }
-    html, body, [class*="css"] { font-family: 'IBM Plex Sans', sans-serif; }
+    html, body, [class*="css"] {{
+        font-family: 'IBM Plex Sans', sans-serif;
+        font-size: {base_font};
+    }}
     h1, h2, h3, .hero-title { font-family: 'Source Serif 4', serif; }
     .stApp {
         background:
@@ -1583,25 +1687,33 @@ def set_custom_css():
         font-size: 0.9rem;
         border-radius: 0 10px 10px 0;
     }
-    .stButton>button {
+    .stButton>button {{
         background: var(--accent);
         color: #ffffff;
         border: none;
         border-radius: 10px;
         font-weight: 600;
-        padding: 0.55rem 1.1rem;
+        padding: {button_padding};
+        font-size: {button_font};
+        min-height: 2.8rem;
         transition: all 0.2s ease;
-    }
-    .stButton>button:hover:not(:disabled) {
+    }}
+    .stButton>button:hover:not(:disabled) {{
         background: #b45309;
         box-shadow: 0 10px 18px rgba(15, 23, 42, 0.12);
         transform: translateY(-1px);
-    }
-    .stButton>button:disabled {
+    }}
+    .stButton>button:disabled {{
         background: #94a3b8;
         cursor: not-allowed;
         opacity: 0.6;
-    }
+    }}
+    .stTextInput input, .stTextArea textarea, .stSelectbox div[data-baseweb="select"], .stMultiSelect div[data-baseweb="select"] {{
+        font-size: {input_font};
+    }}
+    .stCheckbox label, .stRadio label {{
+        font-size: {input_font};
+    }}
     .stProgress > div > div > div > div { background-color: var(--accent); }
     .info-box {
         background: #fff;
@@ -1726,6 +1838,29 @@ def set_custom_css():
         display: block;
         margin-bottom: 0.45rem;
     }
+    .session-thumb {
+        background: linear-gradient(180deg, #fffdf8 0%, #fff7ed 100%);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 0.9rem 1rem;
+        margin: 0.7rem 0 0.45rem 0;
+        box-shadow: var(--shadow);
+    }
+    .session-thumb-title {
+        font-weight: 700;
+        margin-bottom: 0.35rem;
+        color: var(--ink);
+    }
+    .session-thumb-meta {
+        color: var(--muted);
+        font-size: 0.88rem;
+        margin-bottom: 0.45rem;
+    }
+    .session-thumb-preview {
+        color: #334155;
+        font-size: 0.93rem;
+        line-height: 1.5;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1748,13 +1883,102 @@ def refresh_source_options():
     st.session_state.available_sources = sorted({doc.metadata.get("source", "Unknown") for doc in raw_pages})
 
 
+def parse_tags(raw_value: str) -> list[str]:
+    return [part.strip() for part in raw_value.split(",") if part.strip()]
+
+
+def format_slot_timestamp(timestamp: str) -> str:
+    if not timestamp:
+        return ""
+    cleaned = timestamp.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(cleaned).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return timestamp[:16]
+
+
+def parse_multiline_list(raw_value: str) -> list[str]:
+    return [line.strip() for line in (raw_value or "").splitlines() if line.strip()]
+
+
+def serialize_case_board() -> dict:
+    return {
+        "notes": st.session_state.get("case_board_notes", ""),
+        "people": parse_multiline_list(st.session_state.get("case_board_people", "")),
+        "dates": parse_multiline_list(st.session_state.get("case_board_dates", "")),
+        "angles": parse_multiline_list(st.session_state.get("case_board_angles", "")),
+        "excerpts": st.session_state.get("case_board_excerpts", []),
+    }
+
+
+def apply_case_board(payload: dict | None):
+    payload = payload or {}
+    st.session_state.case_board_notes = payload.get("notes", "")
+    st.session_state.case_board_people = "\n".join(payload.get("people", []))
+    st.session_state.case_board_dates = "\n".join(payload.get("dates", []))
+    st.session_state.case_board_angles = "\n".join(payload.get("angles", []))
+    st.session_state.case_board_excerpts = payload.get("excerpts", [])
+
+
+def add_case_board_excerpt(source: str, page: str, excerpt: str):
+    if not excerpt:
+        return
+    item = {"source": str(source or ""), "page": str(page or ""), "excerpt": excerpt.strip()}
+    current = st.session_state.get("case_board_excerpts", [])
+    if any(entry.get("source") == item["source"] and entry.get("page") == item["page"] and entry.get("excerpt") == item["excerpt"] for entry in current):
+        return
+    st.session_state.case_board_excerpts = [item] + current[:24]
+
+
+def get_reporter_template_options(lang: str) -> list[str]:
+    return [REPORTER_TEMPLATES[key]["title"][lang] for key in REPORTER_TEMPLATES]
+
+
+def template_key_from_label(label: str, lang: str) -> str | None:
+    for key, template in REPORTER_TEMPLATES.items():
+        if template["title"][lang] == label:
+            return key
+    return None
+
+
+def apply_reporter_template(template_key: str, lang: str):
+    template = REPORTER_TEMPLATES.get(template_key)
+    if not template:
+        return
+    st.session_state.summary_focus = template["summary_focus"][lang]
+    st.session_state.summary_style = template["summary_style"]
+    st.session_state.summary_target_pages = template["summary_target_pages"]
+    st.session_state.summary_words_per_page = template["summary_words_per_page"]
+    st.session_state.writing_brief = template["writing_brief"][lang]
+    st.session_state.writing_format = template["writing_format"]
+    st.session_state.writing_tone = template["writing_tone"]
+    st.session_state.writing_length = template["writing_length"]
+    st.session_state.reporter_template = template_key
+
+
+def reset_document_dependent_state(clear_chat: bool = True):
+    if clear_chat:
+        st.session_state.chat_history = []
+    st.session_state.quote_candidates = []
+    st.session_state.comparison_results = []
+    st.session_state.comparison_query = ""
+    st.session_state.comparison_last_run = ""
+    st.session_state.writing_sources = []
+    st.session_state.selected_preview_source = ""
+    st.session_state.selected_preview_page = ""
+    st.session_state.preview_excerpt = ""
+    st.session_state.preview_origin = "manual"
+    st.session_state.recent_citations = []
+    st.session_state.preview_bookmarks = []
+
+
 def ingest_uploaded_files(uploaded_files):
     st.session_state.processing = True
     try:
         embeddings = load_embeddings(st.session_state.device_choice, st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
         progress = st.progress(0.0)
         status = st.empty()
-        fingerprint, raw_pages, chunks = cached_process_uploaded_files(
+        fingerprint, raw_pages, chunks, ingest_stats = cached_process_uploaded_files(
             uploaded_files,
             embeddings=embeddings,
             cache_root=CACHE_ROOT,
@@ -1764,13 +1988,15 @@ def ingest_uploaded_files(uploaded_files):
             status_callback=lambda msg: set_status(status, msg),
             progress_callback=lambda value: progress.progress(min(value, 1.0)),
             error_callback=lambda file_name: st.error(f"{get_text('error_pdf_corrupt')} ({file_name})"),
+            use_file_cache=st.session_state.get("performance_mode", False),
         )
         vectorstore = build_or_load_vectorstore(fingerprint, chunks, embeddings, CACHE_ROOT, status_callback=lambda msg: set_status(status, msg))
         st.session_state.raw_pages = raw_pages
         st.session_state.docs = chunks
         st.session_state.vectorstore = vectorstore
         st.session_state.doc_fingerprint = fingerprint
-        st.session_state.chat_history = []
+        st.session_state.last_ingest_stats = ingest_stats
+        reset_document_dependent_state()
         refresh_source_options()
         st.success(get_text("success_docs").format(len(uploaded_files), len(chunks)))
     finally:
@@ -1797,12 +2023,12 @@ def rebuild_from_current_pages():
     st.session_state.docs = chunks
     st.session_state.vectorstore = build_or_load_vectorstore(fingerprint, chunks, embeddings, CACHE_ROOT)
     st.session_state.doc_fingerprint = fingerprint
+    reset_document_dependent_state()
     refresh_source_options()
 
 
 def remove_source(source_name: str):
     st.session_state.raw_pages = [doc for doc in (st.session_state.get("raw_pages") or []) if doc.metadata.get("source") != source_name]
-    st.session_state.chat_history = []
     rebuild_from_current_pages()
 
 
@@ -1814,6 +2040,8 @@ def apply_loaded_slot(payload: dict):
     st.session_state.vectorstore = payload.get("vectorstore")
     st.session_state.lang = payload.get("lang", st.session_state.get("lang", "sv"))
     st.session_state.doc_fingerprint = payload.get("fingerprint", "")
+    reset_document_dependent_state(clear_chat=False)
+    apply_case_board(payload.get("case_board"))
     refresh_source_options()
 
 
@@ -1853,6 +2081,40 @@ def split_assistant_content(content: str):
     return "\n\n".join(body_parts).strip(), notes
 
 
+def build_citation_link(source: str, page: str) -> str:
+    return f"?cite_source={quote(str(source))}&cite_page={quote(str(page))}"
+
+
+def select_preview_target(source: str, page: str = "", excerpt: str = "", origin: str = "manual"):
+    st.session_state.selected_preview_source = str(source or "")
+    st.session_state.selected_preview_page = str(page or "")
+    st.session_state.preview_excerpt = excerpt or ""
+    st.session_state.preview_origin = origin
+    if origin in {"citation", "register", "snippet"} and source:
+        target = {
+            "source": str(source),
+            "page": str(page or ""),
+            "excerpt": excerpt or "",
+            "origin": origin,
+        }
+        recent = st.session_state.get("recent_citations", [])
+        recent = [item for item in recent if not (item.get("source") == target["source"] and item.get("page") == target["page"])]
+        recent.insert(0, target)
+        st.session_state.recent_citations = recent[:8]
+        st.session_state.last_citation_target = f"{target['source']}:{target['page']}"
+
+
+def add_preview_bookmark(source: str, page: str, excerpt: str = ""):
+    if not source:
+        return
+    bookmark = {"source": str(source), "page": str(page or ""), "excerpt": excerpt or ""}
+    bookmarks = st.session_state.get("preview_bookmarks", [])
+    if any(item.get("source") == bookmark["source"] and item.get("page") == bookmark["page"] for item in bookmarks):
+        return
+    bookmarks.append(bookmark)
+    st.session_state.preview_bookmarks = bookmarks
+
+
 def prettify_citations_for_display(text: str, lang: str):
     pattern = r"\[(Källa|Source):\s*([^,\]]+),\s*(sida|page)\s*([^\]]+)\]"
     source_order = []
@@ -1865,7 +2127,8 @@ def prettify_citations_for_display(text: str, lang: str):
         if key not in source_map:
             source_map[key] = len(source_order) + 1
             source_order.append(key)
-        return f"[{source_map[key]}]"
+        index = source_map[key]
+        return f"[[{index}]]({build_citation_link(source, page)})"
 
     cleaned = re.sub(pattern, replacer, text, flags=re.IGNORECASE)
     register = []
@@ -1890,8 +2153,7 @@ def render_citation_register(register: list[dict], lang: str, key_prefix: str):
         col_a, col_b = st.columns([1, 12])
         with col_a:
             if st.button(f"[{item['index']}]", key=f"{key_prefix}-cite-{item['index']}"):
-                st.session_state.selected_preview_source = item["source"]
-                st.session_state.selected_preview_page = str(item["page"])
+                select_preview_target(item["source"], str(item["page"]), origin="register")
                 st.rerun()
         with col_b:
             st.markdown(item["label"])
@@ -1908,11 +2170,30 @@ def render_source_snippets(sources, lang: str, key_prefix: str):
             src = doc.metadata.get("source", "Unknown")
             page = doc.metadata.get("page", "?")
             label = f"s.{page}" if lang == "sv" else f"p.{page}"
-            st.markdown(f'<div class="source-box"><b>{src}</b> ({label})<br>{doc.page_content[:220]}...</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="source-box"><b>{safe_html_fragment(str(src))}</b> ({safe_html_fragment(label)})<br>{safe_html_fragment(doc.page_content[:220])}...</div>',
+                unsafe_allow_html=True,
+            )
             if st.button("Visa källa" if lang == "sv" else "Open source", key=f"{key_prefix}-source-{source_index}"):
-                st.session_state.selected_preview_source = src
-                st.session_state.selected_preview_page = str(page)
+                select_preview_target(src, str(page), excerpt=doc.page_content[:500], origin="snippet")
                 st.rerun()
+
+
+def render_confidence_banner(confidence: dict, lang: str):
+    level = confidence.get("level", "needs_review")
+    if level == "well_supported":
+        st.success(f"{confidence.get('label')}: {confidence.get('reason')}")
+    elif level == "partly_supported":
+        st.info(f"{confidence.get('label')}: {confidence.get('reason')}")
+    else:
+        st.warning(f"{confidence.get('label')}: {confidence.get('reason')}")
+    st.caption(
+        (
+            f"Källhänvisningar: {confidence.get('citation_count', 0)} | Källdokument: {confidence.get('source_count', 0)}"
+            if lang == "sv"
+            else f"Citations: {confidence.get('citation_count', 0)} | Source documents: {confidence.get('source_count', 0)}"
+        )
+    )
 
 
 def get_llm_option_info(model_key: str) -> dict:
@@ -1936,11 +2217,83 @@ def get_available_llm_options(installed_models: list[str]) -> list[str]:
     return installed_models if installed_models else list(LLM_MODELS.keys())
 
 
+def describe_system_profile(profile: dict, lang: str) -> str:
+    cpu = profile.get("cpu_count", 0)
+    ram = profile.get("ram_gb", 0.0)
+    if profile.get("gpu_available"):
+        gpu_name = profile.get("gpu_name", "GPU")
+        vram = profile.get("vram_gb", 0.0)
+        return (
+            f"{cpu} CPU-kärnor | {ram} GB RAM | {gpu_name} ({vram} GB VRAM)"
+            if lang == "sv"
+            else f"{cpu} CPU cores | {ram} GB RAM | {gpu_name} ({vram} GB VRAM)"
+        )
+    return (
+        f"{cpu} CPU-kärnor | {ram} GB RAM | Ingen CUDA-GPU hittades"
+        if lang == "sv"
+        else f"{cpu} CPU cores | {ram} GB RAM | No CUDA GPU detected"
+    )
+
+
+def recommended_startup_preset(recommendations: list[dict]) -> dict | None:
+    for key in ("balanced", "fast", "best"):
+        for preset in recommendations:
+            if preset.get("key") == key:
+                return preset
+    return recommendations[0] if recommendations else None
+
+
+def auto_fix_setup(primary_preset: dict, installed_models: list[str], lang: str) -> list[str]:
+    actions = []
+    if st.session_state.get("device_choice") == "cuda" and not torch.cuda.is_available():
+        st.session_state.device_choice = "auto"
+        actions.append("Återställde processorn till Auto." if lang == "sv" else "Reset processing device to Auto.")
+    if st.session_state.get("embedding_model") not in EMBEDDING_MODELS:
+        st.session_state.embedding_model = primary_preset["embedding_model"]
+        actions.append(
+            f"Valde inbäddningsprofilen {primary_preset['embedding_model']}."
+            if lang == "sv"
+            else f"Selected embedding profile {primary_preset['embedding_model']}."
+        )
+    target_model = primary_preset["llm_model"]
+    resolved_current = resolve_installed_ollama_model(st.session_state.get("llm_model", DEFAULT_LLM_MODEL), installed_models)
+    if resolved_current and resolved_current != st.session_state.get("llm_model"):
+        st.session_state.llm_model = resolved_current
+        actions.append(
+            f"Justerade språkmodellen till installerade {resolved_current}."
+            if lang == "sv"
+            else f"Adjusted the language model to installed model {resolved_current}."
+        )
+    if installed_models and target_model not in installed_models:
+        resolved_target = resolve_installed_ollama_model(target_model, installed_models)
+        if resolved_target:
+            target_model = resolved_target
+    if target_model != st.session_state.get("llm_model"):
+        st.session_state.llm_model = target_model
+        actions.append(
+            f"Valde rekommenderad språkmodell {target_model}."
+            if lang == "sv"
+            else f"Selected recommended language model {target_model}."
+        )
+    if st.session_state.get("embedding_model") != primary_preset["embedding_model"]:
+        st.session_state.embedding_model = primary_preset["embedding_model"]
+        actions.append(
+            f"Valde rekommenderad sökprofil {primary_preset['embedding_model']}."
+            if lang == "sv"
+            else f"Selected recommended search profile {primary_preset['embedding_model']}."
+        )
+    get_startup_checks.clear()
+    load_llm.clear()
+    load_embeddings.clear()
+    return actions
+
+
 def render_system_check(check: dict, lang: str):
     friendly_names = {
         "Python dependencies": "Appens komponenter" if lang == "sv" else "App components",
         "GPU readiness": "Grafikprocessor" if lang == "sv" else "GPU",
         "Ollama": "Ollama-tjänst" if lang == "sv" else "Ollama service",
+        "OCR readiness": "Skannade PDF-filer" if lang == "sv" else "Scanned PDFs",
         "Selected LLM": "Vald språkmodell" if lang == "sv" else "Selected language model",
         "Embedding profile": "Sökprofil" if lang == "sv" else "Search profile",
     }
@@ -1966,7 +2319,9 @@ def pull_ollama_model(model_name: str):
 # -------------------------------------------------------------------
 def main():
     st.set_page_config(page_title=APP_NAME, layout="wide")
-    set_custom_css()
+    if "basic_mode" not in st.session_state:
+        st.session_state.basic_mode = True
+    set_custom_css(st.session_state.get("basic_mode", False))
 
     defaults = {
         "docs": None,
@@ -1976,6 +2331,8 @@ def main():
         "last_summary": "",
         "lang": "sv",
         "device_choice": "auto",
+        "basic_mode": True,
+        "performance_mode": False,
         "llm_model": DEFAULT_LLM_MODEL,
         "embedding_model": DEFAULT_EMBEDDING_MODEL,
         "chunking_strategy": DEFAULT_CHUNKING,
@@ -1997,6 +2354,7 @@ def main():
         "summary_words_per_page": 300,
         "summary_style": "neutral",
         "summary_use_refine": True,
+        "reporter_template": "",
         "writing_brief": "",
         "writing_role": "author",
         "writing_format": "documentary",
@@ -2006,12 +2364,31 @@ def main():
         "writing_pipeline": False,
         "writing_result": "",
         "writing_sources": [],
+        "quote_candidates": [],
+        "comparison_query": "",
+        "comparison_results": [],
+        "comparison_last_run": "",
         "available_sources": [],
         "chat_source_filter": [],
         "writing_source_filter": [],
         "selected_preview_source": "",
         "selected_preview_page": "",
+        "preview_excerpt": "",
+        "preview_origin": "manual",
+        "preview_bookmarks": [],
+        "recent_citations": [],
+        "last_citation_target": "",
         "save_slot_name": "",
+        "save_slot_folder": "",
+        "save_slot_tags": "",
+        "session_folder_filter": "All",
+        "session_tag_filter": "All",
+        "case_board_notes": "",
+        "case_board_people": "",
+        "case_board_dates": "",
+        "case_board_angles": "",
+        "case_board_excerpts": [],
+        "last_ingest_stats": {},
         "doc_fingerprint": "",
     }
     for key, val in defaults.items():
@@ -2021,10 +2398,21 @@ def main():
     check_summary_status()
     refresh_source_options()
     lang = st.session_state.lang
+    query_params = st.query_params
+    cite_source = query_params.get("cite_source")
+    cite_page = query_params.get("cite_page")
+    if cite_source:
+        target = f"{cite_source}:{cite_page or ''}"
+        if target != st.session_state.get("last_citation_target", ""):
+            select_preview_target(cite_source, str(cite_page or ""), origin="citation")
+    system_profile = get_system_profile()
     checks = get_startup_checks(st.session_state.get("llm_model", DEFAULT_LLM_MODEL), st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
     readiness_state, readiness_text = app_readiness_label(st.session_state.get("docs"), st.session_state.get("processing", False))
     installed_models = get_installed_ollama_models()
+    cache_stats = get_cache_stats(CACHE_ROOT)
     available_llm_options = get_available_llm_options(installed_models)
+    recommendations = get_model_recommendations(installed_models, system_profile, list(LLM_MODELS.keys()))
+    primary_preset = recommended_startup_preset(recommendations)
     resolved_selected_model = resolve_installed_ollama_model(st.session_state.get("llm_model", DEFAULT_LLM_MODEL), installed_models)
     if installed_models and not resolved_selected_model:
         preferred_model = "llama3.2:latest" if "llama3.2:latest" in installed_models else installed_models[0]
@@ -2047,77 +2435,207 @@ def main():
         st.caption(get_text("device_current").format(current_device.upper()))
 
         with st.expander("Setup", expanded=True):
+            st.caption("Snabbstart" if lang == "sv" else "Quick start")
+            st.caption(describe_system_profile(system_profile, lang))
             selected_lang = st.selectbox(get_text("language"), options=["sv", "en"], format_func=lambda x: "Svenska" if x == "sv" else "English")
             if selected_lang != st.session_state.lang:
                 st.session_state.lang = selected_lang
                 st.rerun()
-            selected_device = st.selectbox(get_text("device"), options=["auto", "cuda", "cpu"], format_func=lambda x: get_text(f"device_{x}"))
-            if selected_device != st.session_state.device_choice:
-                st.session_state.device_choice = selected_device
+            basic_mode = st.toggle(
+                "Enkelt läge" if lang == "sv" else "Basic mode",
+                value=st.session_state.get("basic_mode", True),
+                help="Förenklar språket och döljer fler tekniska val." if lang == "sv" else "Uses simpler language and hides more technical options.",
+            )
+            if basic_mode != st.session_state.get("basic_mode", True):
+                st.session_state.basic_mode = basic_mode
                 st.rerun()
-            st.caption(get_text("device_info"))
-            st.caption(get_text("ollama_gpu_note"))
+            if basic_mode:
+                st.caption(
+                    "Appen väljer rekommenderade inställningar åt dig. Öppna avancerat läge om du vill finjustera."
+                    if lang == "sv"
+                    else "The app will use recommended settings for you. Open advanced mode if you want manual control."
+                )
+            else:
+                selected_device = st.selectbox(get_text("device"), options=["auto", "cuda", "cpu"], format_func=lambda x: get_text(f"device_{x}"))
+                if selected_device != st.session_state.device_choice:
+                    st.session_state.device_choice = selected_device
+                    st.rerun()
+                st.caption(get_text("device_info"))
+                st.caption(get_text("ollama_gpu_note"))
+            if primary_preset:
+                st.info(
+                    (
+                        f"Rekommenderad startprofil: {primary_preset['label']} med {primary_preset['llm_model']}."
+                        if lang == "sv"
+                        else f"Recommended starter profile: {primary_preset['label']} with {primary_preset['llm_model']}."
+                    )
+                )
+                if st.button("Fixa vanliga problem automatiskt" if lang == "sv" else "Auto-fix common setup issues", use_container_width=True):
+                    messages = auto_fix_setup(primary_preset, installed_models, lang)
+                    if messages:
+                        for msg in messages:
+                            st.success(msg)
+                    else:
+                        st.success("Inställningarna såg redan bra ut." if lang == "sv" else "The setup already looked good.")
+                    st.rerun()
+                selected_model_resolved = resolve_installed_ollama_model(st.session_state.get("llm_model", DEFAULT_LLM_MODEL), installed_models)
+                if primary_preset["llm_model"] not in installed_models and primary_preset["llm_model"] in LLM_MODELS:
+                    install_label = (
+                        f"Ladda ner rekommenderad modell ({primary_preset['llm_model']})"
+                        if lang == "sv"
+                        else f"Download recommended model ({primary_preset['llm_model']})"
+                    )
+                    if st.button(install_label, use_container_width=True):
+                        with st.spinner("Laddar ner modell..." if lang == "sv" else "Downloading model..."):
+                            try:
+                                pull_ollama_model(primary_preset["llm_model"])
+                                st.session_state.llm_model = primary_preset["llm_model"]
+                                st.success(
+                                    f"Modellen {primary_preset['llm_model']} är installerad."
+                                    if lang == "sv"
+                                    else f"Model {primary_preset['llm_model']} is installed."
+                                )
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(
+                                    f"Kunde inte ladda ner modellen: {exc}"
+                                    if lang == "sv"
+                                    else f"Could not download model: {exc}"
+                                )
+                elif selected_model_resolved:
+                    st.caption(
+                        (
+                            f"Nuvarande modell kan användas direkt: {selected_model_resolved}."
+                            if lang == "sv"
+                            else f"Current model is ready to use: {selected_model_resolved}."
+                        )
+                    )
             st.markdown("**Systemstatus**" if lang == "sv" else "**System status**")
             for check in checks:
                 render_system_check(check, lang)
-            with st.expander("Tekniska detaljer" if lang == "sv" else "Technical details", expanded=False):
-                for check in checks:
-                    st.caption(f"{check['name']}: {cleaned_ui_text(check['message'])}")
+            if not basic_mode:
+                with st.expander("Tekniska detaljer" if lang == "sv" else "Technical details", expanded=False):
+                    for check in checks:
+                        st.caption(f"{check['name']}: {cleaned_ui_text(check['message'])}")
 
         with st.expander("Models", expanded=True):
-            llm_model = st.selectbox(
-                get_text("llm_model"),
-                options=available_llm_options,
-                index=available_llm_options.index(selected_llm_value) if available_llm_options else 0,
-                format_func=lambda key: concise_model_label(get_llm_option_info(key), lang),
-                help=("Visar installerade Ollama-modeller på den här datorn." if lang == "sv" else "Shows Ollama models installed on this computer."),
-            )
-            if llm_model != st.session_state.get("llm_model", DEFAULT_LLM_MODEL):
-                st.session_state.llm_model = llm_model
-                st.rerun()
-            missing_known_models = [model for model in LLM_MODELS.keys() if model not in installed_models]
-            if missing_known_models:
-                download_target = st.selectbox(
-                    "Ladda ner modell" if lang == "sv" else "Download model",
-                    options=missing_known_models,
-                    format_func=lambda key: concise_model_label(get_llm_option_info(key), lang),
-                    help="Hämtar modellen via Ollama och gör den tillgänglig i appen." if lang == "sv" else "Downloads the model with Ollama and makes it available in the app.",
+            st.caption("Rekommendationer baserade på den här datorn." if lang == "sv" else "Recommendations based on this computer.")
+            for preset in recommendations:
+                title = (
+                    f"**{preset['label']}**: {preset['llm_model']} + {preset['embedding_model']}"
                 )
-                if st.button("Ladda ner vald modell" if lang == "sv" else "Download selected model", use_container_width=True):
-                    with st.spinner(("Laddar ner modell..." if lang == "sv" else "Downloading model...")):
-                        try:
-                            pull_ollama_model(download_target)
-                            st.success((f"Modellen {download_target} är installerad." if lang == "sv" else f"Model {download_target} is installed."))
-                            st.session_state.llm_model = download_target
-                            st.rerun()
-                        except Exception as exc:
-                            st.error((f"Kunde inte ladda ner modellen: {exc}" if lang == "sv" else f"Could not download model: {exc}"))
-            embedding_model = st.selectbox(
-                get_text("embedding_model"),
-                options=list(EMBEDDING_MODELS.keys()),
-                index=list(EMBEDDING_MODELS.keys()).index(st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL)),
-                format_func=lambda key: concise_model_label(EMBEDDING_MODELS.get(key, {}), lang),
-            )
-            if embedding_model != st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL):
-                st.session_state.embedding_model = embedding_model
-                st.rerun()
-            chunking = st.selectbox(
-                get_text("chunking"),
-                options=list(CHUNKING_STRATEGIES.keys()),
-                index=list(CHUNKING_STRATEGIES.keys()).index(st.session_state.get("chunking_strategy", DEFAULT_CHUNKING)),
-                format_func=lambda key: CHUNKING_STRATEGIES[key]["display_name_en"] if lang == "en" else CHUNKING_STRATEGIES[key]["display_name"],
-            )
-            if chunking != st.session_state.get("chunking_strategy", DEFAULT_CHUNKING):
-                st.session_state.chunking_strategy = chunking
-                if st.session_state.get("raw_pages"):
-                    rebuild_from_current_pages()
-                st.rerun()
+                st.markdown(title)
+                st.caption(
+                    (
+                        f"{preset['summary']} {'Installerad och klar.' if preset['installed'] else 'Kan väljas manuellt eller laddas ner.'}"
+                        if lang == "sv"
+                        else f"{preset['summary']} {'Installed and ready.' if preset['installed'] else 'Can be selected manually or downloaded.'}"
+                    )
+                )
+                if st.button(
+                    (f"Använd {preset['label']}" if lang == "sv" else f"Use {preset['label']}"),
+                    key=f"use-preset-{preset['key']}",
+                    use_container_width=True,
+                ):
+                    st.session_state.llm_model = preset["llm_model"]
+                    st.session_state.embedding_model = preset["embedding_model"]
+                    get_startup_checks.clear()
+                    load_llm.clear()
+                    load_embeddings.clear()
+                    st.rerun()
+            if basic_mode:
+                current_model_name = st.session_state.get("llm_model", DEFAULT_LLM_MODEL)
+                st.caption(
+                    (
+                        f"Nuvarande val: {current_model_name} + {st.session_state.get('embedding_model', DEFAULT_EMBEDDING_MODEL)}"
+                        if lang == "sv"
+                        else f"Current choice: {current_model_name} + {st.session_state.get('embedding_model', DEFAULT_EMBEDDING_MODEL)}"
+                    )
+                )
+            else:
+                llm_model = st.selectbox(
+                    get_text("llm_model"),
+                    options=available_llm_options,
+                    index=available_llm_options.index(selected_llm_value) if available_llm_options else 0,
+                    format_func=lambda key: concise_model_label(get_llm_option_info(key), lang),
+                    help=("Visar installerade Ollama-modeller på den här datorn." if lang == "sv" else "Shows Ollama models installed on this computer."),
+                )
+                if llm_model != st.session_state.get("llm_model", DEFAULT_LLM_MODEL):
+                    st.session_state.llm_model = llm_model
+                    st.rerun()
+                missing_known_models = [model for model in LLM_MODELS.keys() if model not in installed_models]
+                if missing_known_models:
+                    download_target = st.selectbox(
+                        "Ladda ner modell" if lang == "sv" else "Download model",
+                        options=missing_known_models,
+                        format_func=lambda key: concise_model_label(get_llm_option_info(key), lang),
+                        help="Hämtar modellen via Ollama och gör den tillgänglig i appen." if lang == "sv" else "Downloads the model with Ollama and makes it available in the app.",
+                    )
+                    if st.button("Ladda ner vald modell" if lang == "sv" else "Download selected model", use_container_width=True):
+                        with st.spinner(("Laddar ner modell..." if lang == "sv" else "Downloading model...")):
+                            try:
+                                pull_ollama_model(download_target)
+                                st.success((f"Modellen {download_target} är installerad." if lang == "sv" else f"Model {download_target} is installed."))
+                                st.session_state.llm_model = download_target
+                                st.rerun()
+                            except Exception as exc:
+                                st.error((f"Kunde inte ladda ner modellen: {exc}" if lang == "sv" else f"Could not download model: {exc}"))
+                embedding_model = st.selectbox(
+                    get_text("embedding_model"),
+                    options=list(EMBEDDING_MODELS.keys()),
+                    index=list(EMBEDDING_MODELS.keys()).index(st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL)),
+                    format_func=lambda key: concise_model_label(EMBEDDING_MODELS.get(key, {}), lang),
+                )
+                if embedding_model != st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL):
+                    st.session_state.embedding_model = embedding_model
+                    st.rerun()
+                chunking = st.selectbox(
+                    get_text("chunking"),
+                    options=list(CHUNKING_STRATEGIES.keys()),
+                    index=list(CHUNKING_STRATEGIES.keys()).index(st.session_state.get("chunking_strategy", DEFAULT_CHUNKING)),
+                    format_func=lambda key: CHUNKING_STRATEGIES[key]["display_name_en"] if lang == "en" else CHUNKING_STRATEGIES[key]["display_name"],
+                )
+                if chunking != st.session_state.get("chunking_strategy", DEFAULT_CHUNKING):
+                    st.session_state.chunking_strategy = chunking
+                    if st.session_state.get("raw_pages"):
+                        rebuild_from_current_pages()
+                    st.rerun()
 
         with st.expander("Files", expanded=True):
+            performance_mode = st.checkbox(
+                "Stort dokumentläge" if lang == "sv" else "Large-document mode",
+                value=st.session_state.get("performance_mode", False),
+                key="performance_mode",
+                help="Återanvänder filcache och gör uppdateringar smidigare när bara någon fil ändras."
+                if lang == "sv"
+                else "Reuses file cache and makes updates smoother when only a few files change.",
+            )
+            st.caption(
+                (
+                    f"Cache: {cache_stats['bundle_caches']} buntar, {cache_stats['file_caches']} filcacher"
+                    if lang == "sv"
+                    else f"Cache: {cache_stats['bundle_caches']} bundles, {cache_stats['file_caches']} file caches"
+                )
+            )
+            ocr_check = next((check for check in checks if check.get("name") == "OCR readiness"), None)
+            if ocr_check:
+                st.caption(cleaned_ui_text(ocr_check.get("message", "")))
             uploaded_files = st.file_uploader(get_text("upload"), type=["pdf", "docx", "txt", "md"], accept_multiple_files=True, disabled=st.session_state.processing, help=get_text("upload_help"))
             if uploaded_files and st.button(get_text("process_btn"), disabled=st.session_state.processing, use_container_width=True):
                 ingest_uploaded_files(uploaded_files)
                 st.rerun()
+            ingest_stats = st.session_state.get("last_ingest_stats", {})
+            if ingest_stats:
+                if ingest_stats.get("bundle_cache_hit"):
+                    st.info("Hela dokumentuppsättningen laddades från cache." if lang == "sv" else "The full document set was loaded from cache.")
+                elif performance_mode:
+                    st.caption(
+                        (
+                            f"Återanvände {ingest_stats.get('file_cache_hits', 0)} filer från cache, läste om {ingest_stats.get('files_processed', 0)} filer."
+                            if lang == "sv"
+                            else f"Reused {ingest_stats.get('file_cache_hits', 0)} files from cache and re-read {ingest_stats.get('files_processed', 0)} files."
+                        )
+                    )
             if st.session_state.get("docs"):
                 unique_sources = len(set(doc.metadata.get("source", "Unknown") for doc in st.session_state.get("raw_pages", [])))
                 st.info(get_text("chunks_loaded").format(len(st.session_state.docs), unique_sources))
@@ -2125,37 +2643,93 @@ def main():
                 col_preview, col_remove = st.columns([3, 1])
                 with col_preview:
                     if st.button(source, key=f"preview-source-{source}", use_container_width=True):
-                        st.session_state.selected_preview_source = source
-                        st.session_state.selected_preview_page = ""
+                        select_preview_target(source, origin="manual")
                 with col_remove:
                     if st.button("X", key=f"remove-source-{source}", use_container_width=True):
                         remove_source(source)
                         st.rerun()
             st.text_input("Namn på sparning" if lang == "sv" else "Save name", key="save_slot_name", help="Ge sparningen ett eget namn så att du kan ladda den senare." if lang == "sv" else "Give this save a name so you can load it later.")
+            st.text_input("Case-mapp" if lang == "sv" else "Case folder", key="save_slot_folder", help="Till exempel granskning, intervju eller research." if lang == "sv" else "For example investigation, interview, or research.")
+            st.text_input("Taggar" if lang == "sv" else "Tags", key="save_slot_tags", help="Separera med kommatecken." if lang == "sv" else "Separate with commas.")
             if st.button("Spara nuvarande läge" if lang == "sv" else "Save current slot", use_container_width=True, disabled=st.session_state.processing, help="Sparar dokument, chatt, sammanfattning och index i en egen sparning." if lang == "sv" else "Saves documents, chat, summary, and index into its own save slot."):
                 if st.session_state.get("docs"):
                     slot_name = st.session_state.get("save_slot_name") or f"Save {len(list_save_slots(SAVES_ROOT)) + 1}"
-                    slot_id = save_slot(SAVES_ROOT, slot_name, st.session_state.get("docs") or [], st.session_state.get("raw_pages") or [], st.session_state.get("chat_history") or [], st.session_state.get("last_summary", ""), st.session_state.get("lang", "sv"), st.session_state.get("vectorstore"), st.session_state.get("doc_fingerprint", ""))
+                    slot_id = save_slot(
+                        SAVES_ROOT,
+                        slot_name,
+                        st.session_state.get("docs") or [],
+                        st.session_state.get("raw_pages") or [],
+                        st.session_state.get("chat_history") or [],
+                        st.session_state.get("last_summary", ""),
+                        st.session_state.get("lang", "sv"),
+                        st.session_state.get("vectorstore"),
+                        st.session_state.get("doc_fingerprint", ""),
+                        case_folder=st.session_state.get("save_slot_folder", ""),
+                        tags=parse_tags(st.session_state.get("save_slot_tags", "")),
+                        case_board=serialize_case_board(),
+                    )
                     st.success(f"{'Slot sparad' if lang == 'sv' else 'Slot saved'}: {slot_id}")
                 else:
                     st.warning("Inget att spara" if lang == "sv" else "Nothing to save")
             save_slots = list_save_slots(SAVES_ROOT)
             if save_slots:
                 st.caption("Sparade lägen" if lang == "sv" else "Saved slots")
-            for slot in save_slots:
-                st.markdown(f"**{slot.get('name', slot.get('slot_id'))}**")
-                st.caption(f"{slot.get('doc_count', 0)} {'segment' if lang == 'sv' else 'chunks'} | {slot.get('updated_at', '')[:19]}")
-                col_load, col_delete = st.columns(2)
-                with col_load:
-                    if st.button("Ladda" if lang == "sv" else "Load", key=f"load-slot-{slot['slot_id']}", use_container_width=True):
-                        embeddings = load_embeddings(st.session_state.device_choice, st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
-                        apply_loaded_slot(load_slot(SAVES_ROOT, slot["slot_id"], embeddings))
-                        st.success("Sparning laddad" if lang == "sv" else "Save loaded")
-                        st.rerun()
-                with col_delete:
-                    if st.button("Ta bort" if lang == "sv" else "Delete", key=f"delete-slot-{slot['slot_id']}", use_container_width=True):
-                        delete_slot(SAVES_ROOT, slot["slot_id"])
-                        st.rerun()
+                folder_options = ["All"] + sorted({slot.get("case_folder", "").strip() or ("No folder" if lang == "sv" else "No folder") for slot in save_slots})
+                tag_options = ["All"] + sorted({tag for slot in save_slots for tag in slot.get("tags", [])})
+                filter_col_a, filter_col_b = st.columns(2)
+                with filter_col_a:
+                    selected_folder = st.selectbox("Filtrera mapp" if lang == "sv" else "Folder filter", options=folder_options, key="session_folder_filter")
+                with filter_col_b:
+                    selected_tag = st.selectbox("Filtrera tagg" if lang == "sv" else "Tag filter", options=tag_options if len(tag_options) > 1 else ["All"], key="session_tag_filter")
+                filtered_slots = []
+                for slot in save_slots:
+                    slot_folder = slot.get("case_folder", "").strip() or ("No folder" if lang == "sv" else "No folder")
+                    folder_match = selected_folder == "All" or slot_folder == selected_folder
+                    tag_match = selected_tag == "All" or selected_tag in slot.get("tags", [])
+                    if folder_match and tag_match:
+                        filtered_slots.append(slot)
+                grouped_slots = {}
+                for slot in filtered_slots:
+                    folder_name = slot.get("case_folder", "").strip() or ("Utan mapp" if lang == "sv" else "No folder")
+                    grouped_slots.setdefault(folder_name, []).append(slot)
+                for folder_name, slots_in_folder in grouped_slots.items():
+                    st.markdown(f"**{folder_name}**")
+                    for slot in slots_in_folder:
+                        tag_text = ", ".join(slot.get("tags", []))
+                        meta_parts = [
+                            f"{slot.get('doc_count', 0)} {'segment' if lang == 'sv' else 'chunks'}",
+                            format_slot_timestamp(slot.get("updated_at", "")),
+                        ]
+                        if tag_text:
+                            meta_parts.append(f"{'Taggar' if lang == 'sv' else 'Tags'}: {tag_text}")
+                        preview_source = slot.get("preview_source", "")
+                        preview_text = slot.get("preview_text", "")
+                        if preview_source:
+                            meta_parts.append(preview_source)
+                        session_title = safe_html_fragment(str(slot.get('name', slot.get('slot_id'))))
+                        session_meta = safe_html_fragment(" | ".join(part for part in meta_parts if part))
+                        session_preview = safe_html_fragment(preview_text or ("Ingen förhandsvisning ännu." if lang == "sv" else "No preview yet."))
+                        st.markdown(
+                            f"""
+                            <div class="session-thumb">
+                                <div class="session-thumb-title">{session_title}</div>
+                                <div class="session-thumb-meta">{session_meta}</div>
+                                <div class="session-thumb-preview">{session_preview}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                        col_load, col_delete = st.columns(2)
+                        with col_load:
+                            if st.button("Ladda" if lang == "sv" else "Load", key=f"load-slot-{slot['slot_id']}", use_container_width=True):
+                                embeddings = load_embeddings(st.session_state.device_choice, st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
+                                apply_loaded_slot(load_slot(SAVES_ROOT, slot["slot_id"], embeddings))
+                                st.success("Sparning laddad" if lang == "sv" else "Save loaded")
+                                st.rerun()
+                        with col_delete:
+                            if st.button("Ta bort" if lang == "sv" else "Delete", key=f"delete-slot-{slot['slot_id']}", use_container_width=True):
+                                delete_slot(SAVES_ROOT, slot["slot_id"])
+                                st.rerun()
             st.caption("All behandling sker lokalt. Sparningar ligger i session_data/saves." if lang == "sv" else "All processing is local. Saves are stored in session_data/saves.")
 
     if st.session_state.processing:
@@ -2186,6 +2760,7 @@ def main():
     with col_right:
         preview_source = st.session_state.get("selected_preview_source", "")
         preview_page = st.session_state.get("selected_preview_page", "")
+        preview_excerpt = st.session_state.get("preview_excerpt", "")
         preview_docs = [doc for doc in (st.session_state.get("raw_pages") or []) if doc.metadata.get("source") == preview_source]
         st.markdown(f"""
             <div class="card">
@@ -2197,16 +2772,72 @@ def main():
                 </div>
             </div>
             """, unsafe_allow_html=True)
+        if st.session_state.get("available_sources"):
+            st.markdown("### " + ("Dokumentnavigator" if lang == "sv" else "Document Navigator"))
+            navigator_source = st.selectbox(
+                "Fil" if lang == "sv" else "File",
+                options=st.session_state.get("available_sources", []),
+                index=st.session_state.get("available_sources", []).index(preview_source) if preview_source in st.session_state.get("available_sources", []) else 0,
+                key="navigator_source",
+            )
+            if navigator_source != preview_source:
+                select_preview_target(navigator_source, origin="manual")
+                st.rerun()
+            navigator_docs = [doc for doc in (st.session_state.get("raw_pages") or []) if doc.metadata.get("source") == navigator_source]
+            st.caption(
+                (
+                    f"{len(navigator_docs)} sidor tillgängliga"
+                    if lang == "sv"
+                    else f"{len(navigator_docs)} pages available"
+                )
+            )
+            if st.session_state.get("recent_citations"):
+                with st.expander("Senaste källhopp" if lang == "sv" else "Recent citation jumps", expanded=False):
+                    for idx, item in enumerate(st.session_state.get("recent_citations", [])):
+                        label = f"{item.get('source')} - {('sida' if lang == 'sv' else 'page')} {item.get('page') or '?'}"
+                        if st.button(label, key=f"recent-citation-{idx}", use_container_width=True):
+                            select_preview_target(item.get("source", ""), item.get("page", ""), excerpt=item.get("excerpt", ""), origin="citation")
+                            st.rerun()
+            if st.session_state.get("preview_bookmarks"):
+                with st.expander("Bokmärken" if lang == "sv" else "Bookmarks", expanded=False):
+                    for idx, item in enumerate(st.session_state.get("preview_bookmarks", [])):
+                        label = f"{item.get('source')} - {('sida' if lang == 'sv' else 'page')} {item.get('page') or '?'}"
+                        col_open, col_remove = st.columns([4, 1])
+                        with col_open:
+                            if st.button(label, key=f"bookmark-open-{idx}", use_container_width=True):
+                                select_preview_target(item.get("source", ""), item.get("page", ""), excerpt=item.get("excerpt", ""), origin="manual")
+                                st.rerun()
+                        with col_remove:
+                            if st.button("X", key=f"bookmark-remove-{idx}", use_container_width=True):
+                                bookmarks = st.session_state.get("preview_bookmarks", [])
+                                st.session_state.preview_bookmarks = [b for b in bookmarks if not (b.get("source") == item.get("source") and b.get("page") == item.get("page"))]
+                                st.rerun()
         if preview_source and preview_docs:
             st.markdown("### " + ("Dokumentförhandsvisning" if lang == "sv" else "Document Preview"))
             page_options = [str(doc.metadata.get("page", "?")) for doc in preview_docs]
             selected_page = st.selectbox("Sida" if lang == "sv" else "Page", options=page_options, index=page_options.index(preview_page) if preview_page in page_options else 0)
-            st.session_state.selected_preview_page = selected_page
+            if selected_page != preview_page:
+                st.session_state.selected_preview_page = selected_page
+                st.session_state.preview_excerpt = ""
+                st.session_state.preview_origin = "manual"
             selected_doc = next((doc for doc in preview_docs if str(doc.metadata.get("page", "?")) == selected_page), preview_docs[0])
             st.caption(preview_source)
+            bookmark_col, info_col = st.columns([1, 2])
+            with bookmark_col:
+                if st.button("Bokmärk sida" if lang == "sv" else "Bookmark page", use_container_width=True):
+                    add_preview_bookmark(preview_source, selected_page, excerpt=preview_excerpt or selected_doc.page_content[:500])
+                    st.rerun()
+            with info_col:
+                st.caption("Klicka på en källhänvisning för att hoppa hit." if lang == "sv" else "Click a citation to jump here.")
+            if preview_excerpt:
+                st.markdown("**Markerad passage**" if lang == "sv" else "**Highlighted passage**")
+                st.markdown(
+                    f'<div class="source-box" style="border-left: 4px solid #d97706; background: #fff7ed;">{safe_html_fragment(preview_excerpt)}</div>',
+                    unsafe_allow_html=True,
+                )
             st.text_area("Preview", selected_doc.page_content[:2500], height=220)
 
-    tab_chat, tab_summary, tab_write, tab_analysis, tab_export = st.tabs(["Chat", "Sammanfatta" if lang == "sv" else "Summary", "Skrivstudio" if lang == "sv" else "Writing Studio", "Analys" if lang == "sv" else "Analysis", "Export"])
+    tab_chat, tab_summary, tab_write, tab_analysis, tab_board, tab_export = st.tabs(["Chat", "Sammanfatta" if lang == "sv" else "Summary", "Skrivstudio" if lang == "sv" else "Writing Studio", "Analys" if lang == "sv" else "Analysis", "Case board" if lang == "en" else "Case board", "Export"])
 
     with tab_chat:
         render_page_header(
@@ -2247,6 +2878,13 @@ def main():
                 message_sources = msg.get("sources", [])
                 message_issues = msg.get("issues", [])
                 with st.chat_message("assistant"):
+                    confidence = assess_answer_confidence(
+                        msg["content"],
+                        records_to_docs(message_sources) if message_sources and isinstance(message_sources[0], dict) else (message_sources or []),
+                        message_issues,
+                        lang,
+                    )
+                    render_confidence_banner(confidence, lang)
                     st.markdown(body)
                     tools_left, tools_right = st.columns([1, 1])
                     with tools_left:
@@ -2273,6 +2911,8 @@ def main():
             body, notes = split_assistant_content(answer)
             body, register = prettify_citations_for_display(body or answer, lang)
             with st.chat_message("assistant"):
+                confidence = assess_answer_confidence(answer, sources, issues, lang)
+                render_confidence_banner(confidence, lang)
                 st.markdown(body)
                 tools_left, tools_right = st.columns([1, 1])
                 with tools_left:
@@ -2317,6 +2957,23 @@ def main():
                 "- Very long targets may be capped to keep output stable."
             ),
         )
+        template_labels = get_reporter_template_options(lang)
+        current_template_key = st.session_state.get("reporter_template", "")
+        current_template_label = REPORTER_TEMPLATES[current_template_key]["title"][lang] if current_template_key in REPORTER_TEMPLATES else template_labels[0]
+        template_col_a, template_col_b = st.columns([3, 1])
+        with template_col_a:
+            selected_template_label = st.selectbox(
+                "Reporter-mall" if lang == "sv" else "Reporter template",
+                options=template_labels,
+                index=template_labels.index(current_template_label) if current_template_label in template_labels else 0,
+                key="reporter_template_label",
+            )
+        with template_col_b:
+            if st.button("Använd mall" if lang == "sv" else "Apply template", use_container_width=True):
+                template_key = template_key_from_label(selected_template_label, lang)
+                if template_key:
+                    apply_reporter_template(template_key, lang)
+                    st.rerun()
         if not st.session_state.docs:
             st.info(get_text("error_no_docs"))
         else:
@@ -2368,6 +3025,13 @@ def main():
                 st.markdown(f'<div class="warning-box">{"Fel: " if lang=="sv" else "Error: "}{error_msg}</div>', unsafe_allow_html=True)
         elif st.session_state.summary_result:
             st.markdown("### " + ("Sammanfattning" if lang == "sv" else "Summary"))
+            summary_confidence = assess_answer_confidence(
+                st.session_state.summary_result,
+                st.session_state.get("raw_pages") or [],
+                ["missing_citations"] if not ("[Source:" in st.session_state.summary_result or "[Källa:" in st.session_state.summary_result) else [],
+                lang,
+            )
+            render_confidence_banner(summary_confidence, lang)
             summary_body, summary_register = prettify_citations_for_display(st.session_state.summary_result, lang)
             st.markdown(summary_body)
             render_citation_register(summary_register, lang, key_prefix="summary")
@@ -2401,6 +3065,13 @@ def main():
                 "- Source filters help keep the draft tied to the right documents."
             ),
         )
+        if st.session_state.get("reporter_template") in REPORTER_TEMPLATES:
+            template_name = REPORTER_TEMPLATES[st.session_state["reporter_template"]]["title"][lang]
+            st.caption(
+                f"Aktiv mall: {template_name}"
+                if lang == "sv"
+                else f"Active template: {template_name}"
+            )
         brief = st.text_area(get_text("writing_brief"), placeholder=get_text("writing_placeholder"), height=140, key="writing_brief")
         col_a, col_b = st.columns(2)
         with col_a:
@@ -2420,11 +3091,46 @@ def main():
             st.session_state.writing_sources = used_sources
         if st.session_state.get("writing_result"):
             st.markdown("### " + get_text("writing_result"))
+            writing_sources = st.session_state.get("writing_sources", [])
+            writing_confidence = assess_answer_confidence(
+                st.session_state.writing_result,
+                writing_sources,
+                ["missing_citations"] if st.session_state.get("writing_use_sources", True) and writing_sources and not ("[Source:" in st.session_state.writing_result or "[Källa:" in st.session_state.writing_result) else [],
+                lang,
+            )
+            render_confidence_banner(writing_confidence, lang)
             writing_body, writing_register = prettify_citations_for_display(st.session_state.writing_result, lang)
             st.markdown(writing_body)
             render_citation_register(writing_register, lang, key_prefix="writing")
-            sources = st.session_state.get("writing_sources", [])
-            render_source_snippets(sources, lang, "writing")
+            render_source_snippets(writing_sources, lang, "writing")
+            claim_items = extract_claim_check_items(st.session_state.writing_result, lang)
+            flagged_items = [item for item in claim_items if item["needs_review"]]
+            with st.expander("Claim checker" if lang == "en" else "Påståendekontroll", expanded=bool(flagged_items)):
+                if not flagged_items:
+                    st.success(
+                        "No obvious unsupported draft claims were flagged."
+                        if lang == "en"
+                        else "Inga uppenbart osäkra påståenden flaggades i utkastet."
+                    )
+                else:
+                    st.warning(
+                        (
+                            f"{len(flagged_items)} formuleringar bör verifieras innan publicering."
+                            if lang == "sv"
+                            else f"{len(flagged_items)} draft statements should be verified before publishing."
+                        )
+                    )
+                    for idx, item in enumerate(flagged_items[:15], start=1):
+                        st.markdown(f"**{idx}.** {item['sentence']}")
+                        reason_labels = []
+                        if "missing_citation" in item["reasons"]:
+                            reason_labels.append("saknar källhänvisning" if lang == "sv" else "missing citation")
+                        if "speculative_language" in item["reasons"]:
+                            reason_labels.append("osäker formulering" if lang == "sv" else "speculative wording")
+                        if "number_without_citation" in item["reasons"]:
+                            reason_labels.append("siffra utan källa" if lang == "sv" else "number without citation")
+                        if reason_labels:
+                            st.caption(", ".join(reason_labels))
 
     with tab_analysis:
         render_page_header(
@@ -2434,7 +3140,7 @@ def main():
             (
                 "### Vad den gör\n"
                 "- Hjälper dig hitta namn, organisationer och platser.\n"
-                "- Tar fram datum, nyckelord och enklare sentiment.\n\n"
+                "- Tar fram datum, nyckelord, citat, källjämförelser och enklare sentiment.\n\n"
                 "### Bra att veta\n"
                 "- Resultaten är till för översikt och researchstöd.\n"
                 "- Dubbelkolla alltid viktiga slutsatser i originalkällan."
@@ -2444,7 +3150,7 @@ def main():
             (
                 "### What it does\n"
                 "- Helps you find names, organizations, and places.\n"
-                "- Pulls out dates, keywords, and basic sentiment.\n\n"
+                "- Pulls out dates, keywords, quotes, source comparisons, and basic sentiment.\n\n"
                 "### Good to know\n"
                 "- Results are for overview and research support.\n"
                 "- Always verify important conclusions in the original source."
@@ -2455,7 +3161,7 @@ def main():
         else:
             ner_pipeline = load_ner_pipeline(st.session_state.device_choice)
             sent_pipeline = load_sentiment_pipeline(st.session_state.device_choice)
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
                 if st.button(get_text("ner_extract"), disabled=st.session_state.processing):
                     with st.spinner("Extraherar..." if lang == "sv" else "Extracting..."):
@@ -2477,10 +3183,153 @@ def main():
                     with st.spinner("Extraherar nyckelord..." if lang == "sv" else "Extracting keywords..."):
                         text = st.session_state.last_summary if st.session_state.last_summary else st.session_state.docs[0].page_content
                         st.write("Toppnyckelord:" if lang == "sv" else "Top keywords:", ", ".join(extract_keywords(text, language="sv" if lang == "sv" else "en")))
+            with col4:
+                if st.button("Hitta citat" if lang == "sv" else "Find quotes", disabled=st.session_state.processing):
+                    with st.spinner("Söker citat..." if lang == "sv" else "Finding quotes..."):
+                        st.session_state.quote_candidates = extract_quote_candidates(st.session_state.raw_pages[:200])
+            comparison_col_a, comparison_col_b = st.columns([4, 1])
+            with comparison_col_a:
+                st.text_input(
+                    "Jämför person, händelse eller påstående" if lang == "sv" else "Compare person, event, or claim",
+                    key="comparison_query",
+                    placeholder="t.ex. minister budget 2024" if lang == "sv" else "e.g. minister budget 2024",
+                )
+            with comparison_col_b:
+                if st.button("Jämför källor" if lang == "sv" else "Compare sources", disabled=st.session_state.processing or not st.session_state.get("comparison_query", "").strip(), use_container_width=True):
+                    comparison_query = st.session_state.get("comparison_query", "")
+                    st.session_state.comparison_results = compare_sources(st.session_state.raw_pages[:300], comparison_query)
+                    st.session_state.comparison_last_run = comparison_query
+            if st.session_state.get("comparison_results"):
+                header_col_a, header_col_b = st.columns([3, 1])
+                with header_col_a:
+                    st.markdown("### " + ("Källjämförelse" if lang == "sv" else "Source comparison"))
+                with header_col_b:
+                    if st.button("Rensa" if lang == "sv" else "Clear", key="clear-comparison-results", use_container_width=True):
+                        st.session_state.comparison_results = []
+                        st.session_state.comparison_query = ""
+                        st.session_state.comparison_last_run = ""
+                        st.rerun()
+                for idx, item in enumerate(st.session_state.get("comparison_results", [])):
+                    st.markdown(f"**{item['source']}**")
+                    st.caption(f"{'Sida' if lang == 'sv' else 'Page'} {item['page']} | {'träffar' if lang == 'sv' else 'matches'} {item['score']}")
+                    st.markdown(
+                        f'<div class="source-box">{safe_html_fragment(item["excerpt"])}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("Öppna i navigatorn" if lang == "sv" else "Open in navigator", key=f"comparison-open-{idx}", use_container_width=True):
+                        select_preview_target(item["source"], str(item["page"]), excerpt=item["excerpt"], origin="snippet")
+                        st.rerun()
+            elif st.session_state.get("comparison_last_run"):
+                st.info(
+                    (
+                        f"Inga tydliga träffar hittades för '{st.session_state.get('comparison_last_run')}'."
+                        if lang == "sv"
+                        else f"No clear source matches were found for '{st.session_state.get('comparison_last_run')}'."
+                    )
+                )
+            if st.session_state.get("quote_candidates"):
+                header_col_a, header_col_b = st.columns([3, 1])
+                with header_col_a:
+                    st.markdown("### " + ("Citatkandidater" if lang == "sv" else "Quote candidates"))
+                with header_col_b:
+                    if st.button("Rensa" if lang == "sv" else "Clear", key="clear-quote-candidates", use_container_width=True):
+                        st.session_state.quote_candidates = []
+                        st.rerun()
+                for idx, item in enumerate(st.session_state.get("quote_candidates", [])[:20]):
+                    st.markdown(f'> "{item["quote"]}"')
+                    st.caption(
+                        f'{item["source"]} | {("sida" if lang == "sv" else "page")} {item["page"]}'
+                    )
+                    st.caption(item["context"][:220] + ("..." if len(item["context"]) > 220 else ""))
+                    if st.button("Öppna källa" if lang == "sv" else "Open source", key=f"quote-open-{idx}", use_container_width=True):
+                        select_preview_target(item["source"], str(item["page"]), excerpt=item["quote"], origin="snippet")
+                        st.rerun()
             if st.session_state.last_summary and st.button(get_text("sentiment"), disabled=st.session_state.processing):
                 with st.spinner("Analyserar sentiment..." if lang == "sv" else "Analyzing sentiment..."):
                     result = analyze_sentiment(st.session_state.last_summary, sent_pipeline)
                     st.write(f"Sentiment: **{result['label']}** (konfidens: {result['score']:.2f})" if lang == "sv" else f"Sentiment: **{result['label']}** (confidence: {result['score']:.2f})")
+
+    with tab_board:
+        render_page_header(
+            "Case board" if lang == "en" else "Case board",
+            "Samla arbetsnoter, personer, datum, utdrag och vinklar på ett ställe." if lang == "sv" else "Collect working notes, people, dates, excerpts, and angles in one place.",
+            "Om Case board" if lang == "sv" else "About Case board",
+            (
+                "### Vad den gör\n"
+                "- Samlar dina viktigaste arbetsnoter.\n"
+                "- Sparar personer, datum, vinklar och källutdrag för fallet.\n"
+                "- Följer med när du sparar sessionen.\n\n"
+                "### Tips\n"
+                "- Klistra in namn eller datum rad för rad.\n"
+                "- Lägg till markerade utdrag från dokumentförhandsvisningen."
+            )
+            if lang == "sv"
+            else
+            (
+                "### What it does\n"
+                "- Keeps your core reporting notes in one place.\n"
+                "- Stores people, dates, angles, and pinned excerpts for the case.\n"
+                "- Travels with the session when you save it.\n\n"
+                "### Tips\n"
+                "- Add one person or date per line.\n"
+                "- Pin highlighted excerpts from the document preview."
+            ),
+        )
+        note_col, list_col = st.columns([2, 1])
+        with note_col:
+            st.text_area(
+                "Arbetsnoter" if lang == "sv" else "Working notes",
+                key="case_board_notes",
+                height=180,
+                placeholder="Skriv vad som verkar viktigt, vad som saknas och vad du vill följa upp."
+                if lang == "sv"
+                else "Write what seems important, what is missing, and what you want to follow up on.",
+            )
+            preview_source = st.session_state.get("selected_preview_source", "")
+            preview_page = st.session_state.get("selected_preview_page", "")
+            preview_excerpt = st.session_state.get("preview_excerpt", "")
+            if preview_source and (preview_excerpt or preview_page):
+                if st.button("Fäst aktuellt utdrag" if lang == "sv" else "Pin current excerpt", use_container_width=True):
+                    excerpt_text = preview_excerpt or next(
+                        (
+                            doc.page_content[:500]
+                            for doc in (st.session_state.get("raw_pages") or [])
+                            if doc.metadata.get("source") == preview_source and str(doc.metadata.get("page", "")) == str(preview_page)
+                        ),
+                        "",
+                    )
+                    add_case_board_excerpt(preview_source, preview_page, excerpt_text)
+                    st.rerun()
+        with list_col:
+            st.text_area("Viktiga personer" if lang == "sv" else "Key people", key="case_board_people", height=120, placeholder="En person per rad" if lang == "sv" else "One person per line")
+            st.text_area("Viktiga datum" if lang == "sv" else "Key dates", key="case_board_dates", height=120, placeholder="Ett datum per rad" if lang == "sv" else "One date per line")
+            st.text_area("Vinklar / hypoteser" if lang == "sv" else "Angles / hypotheses", key="case_board_angles", height=120, placeholder="En möjlig vinkel per rad" if lang == "sv" else "One possible angle per line")
+        st.markdown("### " + ("Fästa utdrag" if lang == "sv" else "Pinned excerpts"))
+        pinned_excerpts = st.session_state.get("case_board_excerpts", [])
+        if not pinned_excerpts:
+            st.info("Inga utdrag har fästs ännu." if lang == "sv" else "No excerpts have been pinned yet.")
+        else:
+            clear_col_a, clear_col_b = st.columns([3, 1])
+            with clear_col_b:
+                if st.button("Rensa alla" if lang == "sv" else "Clear all", key="clear-board-excerpts", use_container_width=True):
+                    st.session_state.case_board_excerpts = []
+                    st.rerun()
+            for idx, item in enumerate(pinned_excerpts):
+                st.markdown(f"**{item.get('source', 'Unknown')}** | {('sida' if lang == 'sv' else 'page')} {item.get('page', '?')}")
+                st.markdown(
+                    f'<div class="source-box">{safe_html_fragment(item.get("excerpt", ""))}</div>',
+                    unsafe_allow_html=True,
+                )
+                action_col_a, action_col_b = st.columns(2)
+                with action_col_a:
+                    if st.button("Öppna i navigatorn" if lang == "sv" else "Open in navigator", key=f"board-open-{idx}", use_container_width=True):
+                        select_preview_target(item.get("source", ""), item.get("page", ""), excerpt=item.get("excerpt", ""), origin="snippet")
+                        st.rerun()
+                with action_col_b:
+                    if st.button("Ta bort" if lang == "sv" else "Remove", key=f"board-remove-{idx}", use_container_width=True):
+                        current = st.session_state.get("case_board_excerpts", [])
+                        st.session_state.case_board_excerpts = [entry for entry in current if entry != item]
+                        st.rerun()
 
     with tab_export:
         render_page_header(
@@ -2512,15 +3361,26 @@ def main():
             st.info("Generera en sammanfattning först." if lang == "sv" else "Generate a summary first.")
         else:
             text = st.session_state.last_summary
+            safer_exports = st.checkbox(
+                "Använd säkrare export med slutnoter och källbilaga" if lang == "sv" else "Use safer export with endnotes and source appendix",
+                value=True,
+                key="export_safe_mode",
+            )
             col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.download_button("TXT", export_text(text), "sammanfattning.txt" if lang == "sv" else "summary.txt", mime="text/plain")
+                st.download_button("TXT", export_text(text, lang, safer_exports), "sammanfattning.txt" if lang == "sv" else "summary.txt", mime="text/plain")
             with col2:
-                st.download_button("DOCX", export_docx(text), "sammanfattning.docx" if lang == "sv" else "summary.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                st.download_button("DOCX", export_docx(text, lang, safer_exports), "sammanfattning.docx" if lang == "sv" else "summary.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
             with col3:
-                st.download_button("PDF", export_pdf(text), "sammanfattning.pdf" if lang == "sv" else "summary.pdf", mime="application/pdf")
+                st.download_button("PDF", export_pdf(text, lang, safer_exports), "sammanfattning.pdf" if lang == "sv" else "summary.pdf", mime="application/pdf")
             with col4:
-                st.download_button("MD", export_markdown(text), "sammanfattning.md" if lang == "sv" else "summary.md", mime="text/markdown")
+                st.download_button("MD", export_markdown(text, lang, safer_exports), "sammanfattning.md" if lang == "sv" else "summary.md", mime="text/markdown")
+            if safer_exports:
+                st.caption(
+                    "Exporten lägger till slutnoter och en källbilaga baserat på upptäckta hänvisningar."
+                    if lang == "sv"
+                    else "The export adds endnotes and a source appendix based on detected citations."
+                )
             if st.button(get_text("bias_check"), disabled=st.session_state.processing):
                 with st.spinner("Kontrollerar partiskhet..." if lang == "sv" else "Checking for bias..."):
                     llm = load_llm(st.session_state.device_choice)

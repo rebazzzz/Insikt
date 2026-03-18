@@ -1,0 +1,2 @@
+"""Insikt application modules."""
+

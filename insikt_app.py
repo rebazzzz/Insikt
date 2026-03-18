@@ -1,8 +1,8 @@
 ﻿"""
-Insikt â€“ Journalist AI Suite
-GPUâ€‘accelerated, 100% local, free. Swedish/English bilingual.
-Features: Background summarization, realâ€‘time chat with document RAG, entity extraction, timeline, sentiment, export.
-Now with userâ€‘selectable GPU/CPU processing.
+Insikt – Journalist AI Suite
+GPU-accelerated, 100% local, free. Swedish/English bilingual.
+Features: Background summarization, real-time chat with document RAG, entity extraction, timeline, sentiment, export.
+Now with user-selectable GPU/CPU processing.
 """
 
 import os
@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import streamlit as st
 from streamlit.runtime.uploaded_file_manager import UploadedFile
+import streamlit.components.v1 as components
 
 # GPU detection
 import torch
@@ -40,10 +41,24 @@ from fpdf import FPDF
 from transformers import pipeline
 import yake
 
+from insikt.analysis import analyze_sentiment, bias_check, extract_entities, extract_keywords, extract_timeline, translate_text
+from insikt.common import cleaned_ui_text
+from insikt.exports import export_docx, export_markdown, export_pdf, export_text
+from insikt.pipeline import build_or_load_vectorstore, process_uploaded_files as cached_process_uploaded_files, rechunk_pages
+from insikt.rag import chat_with_docs as rag_chat_with_docs
+from insikt.rag import generate_writing as rag_generate_writing
+from insikt.session_store import delete_slot, list_save_slots, load_slot, save_slot
+from insikt.summarization import SummaryThread as ModularSummaryThread
+from insikt.summarization import generate_doc_hash as modular_generate_doc_hash
+from insikt.ui import app_readiness_label, concise_model_label
+from insikt.validation import run_startup_checks
+
 # -------------------------------------------------------------------
 # Configuration & Language
 # -------------------------------------------------------------------
 APP_NAME = "Insikt"
+CACHE_ROOT = Path("session_data/cache")
+SAVES_ROOT = Path("session_data/saves")
 
 # LLM Models - Optimized for performance and accuracy
 # Quantized models are smaller, faster, and use less memory while maintaining good quality
@@ -51,37 +66,37 @@ LLM_MODELS = {
     "llama3.2": {
         "display_name": "Llama 3.2 (Standard)",
         "display_name_en": "Llama 3.2 (Standard)",
-        "description": "BÃ¤sta kvalitet men krÃ¤ver mer minne. Rekommenderas fÃ¶r kraftfulla datorer.",
+        "description": "Bästa kvalitet men kräver mer minne. Rekommenderas för kraftfulla datorer.",
         "description_en": "Best quality but requires more memory. Recommended for powerful computers.",
-        "speed": "âš¡âš¡",
-        "quality": "â­â­â­â­â­",
+        "speed": "Hastighet: Medel",
+        "quality": "Kvalitet: Mycket hög",
         "memory": "High",
     },
     "llama3.2:3b": {
         "display_name": "Llama 3.2 3B (Snabb)",
         "display_name_en": "Llama 3.2 3B (Fast)",
-        "description": "Snabbare och mindre minneskrÃ¤vande. Bra balans mellan hastighet och kvalitet.",
+        "description": "Snabbare och mindre minneskrävande. Bra balans mellan hastighet och kvalitet.",
         "description_en": "Faster and less memory intensive. Good balance between speed and quality.",
-        "speed": "âš¡âš¡âš¡âš¡",
-        "quality": "â­â­â­â­",
+        "speed": "Hastighet: Hög",
+        "quality": "Kvalitet: Hög",
         "memory": "Medium",
     },
     "llama3.2:1b": {
         "display_name": "Llama 3.2 1B (Turbo)",
         "display_name_en": "Llama 3.2 1B (Turbo)",
-        "description": "Snabbast och minst minneskrÃ¤vande. FÃ¶r svagare datorer eller quick tests.",
+        "description": "Snabbast och minst minneskrävande. För svagare datorer eller snabba tester.",
         "description_en": "Fastest and most memory efficient. For weaker computers or quick tests.",
-        "speed": "âš¡âš¡âš¡âš¡âš¡",
-        "quality": "â­â­â­",
+        "speed": "Hastighet: Mycket hög",
+        "quality": "Kvalitet: Medel",
         "memory": "Low",
     },
     "mistral:7b": {
         "display_name": "Mistral 7B",
         "display_name_en": "Mistral 7B",
-        "description": "Alternativ modell med bra prestanda. Bra fÃ¶r engelska dokument.",
+        "description": "Alternativ modell med bra prestanda. Bra för engelska dokument.",
         "description_en": "Alternative model with good performance. Good for English documents.",
-        "speed": "âš¡âš¡âš¡",
-        "quality": "â­â­â­â­",
+        "speed": "Hastighet: Medel",
+        "quality": "Kvalitet: Hög",
         "memory": "High",
     },
 }
@@ -92,16 +107,16 @@ CHUNKING_STRATEGIES = {
     "semantic": {
         "display_name": "Smart (Semantisk)",
         "display_name_en": "Smart (Semantic)",
-        "description": "Delar dokument baserat pÃ¥ mening och sammanhang. BÃ¤st fÃ¶r lÃ¤ngre dokument.",
+        "description": "Delar dokument baserat på mening och sammanhang. Bäst för längre dokument.",
         "description_en": "Splits documents based on meaning and context. Best for longer documents.",
-        "icon": "ðŸ§ ",
+        "icon": "",
     },
     "fixed": {
         "display_name": "Standard (Fast storlek)",
         "display_name_en": "Standard (Fixed size)",
-        "description": "Delar dokument i jÃ¤mna delar. Snabbare men mindre flexibelt.",
+        "description": "Delar dokument i jämna delar. Snabbare men mindre flexibelt.",
         "description_en": "Splits documents into equal parts. Faster but less flexible.",
-        "icon": "ðŸ“",
+        "icon": "",
     },
 }
 DEFAULT_CHUNKING = "semantic"
@@ -117,19 +132,19 @@ EMBEDDING_MODELS = {
         "model_name": "BAAI/bge-small-en-v1.5",
         "display_name": "Snabb (bge-small)",  # Fast (bge-small)
         "display_name_en": "Fast (bge-small)",
-        "description": "Snabbare, mindre noggrann. Bra fÃ¶r testning och svaga datorer.",  # Faster, less accurate. Good for testing and weak computers.
+        "description": "Snabbare, mindre noggrann. Bra för testning och svaga datorer.",  # Faster, less accurate. Good for testing and weak computers.
         "description_en": "Faster, less accurate. Good for testing and weaker computers.",
-        "speed": "âš¡âš¡âš¡âš¡âš¡",  # 5 lightning bolts for fastest
-        "quality": "â­â­",    # 2 stars for quality
+        "speed": "Hastighet: Mycket hög",
+        "quality": "Kvalitet: Låg",
     },
     "bge-base": {
         "model_name": "BAAI/bge-base-en-v1.5",
         "display_name": "Balanserad (bge-base)",  # Balanced (bge-base)
         "display_name_en": "Balanced (bge-base)",
-        "description": "BÃ¤sta valet! Balans mellan hastighet och noggrannhet.",  # Best choice! Balance between speed and accuracy.
+        "description": "Bästa valet! Balans mellan hastighet och noggrannhet.",  # Best choice! Balance between speed and accuracy.
         "description_en": "Best choice! Balance between speed and accuracy.",
-        "speed": "âš¡âš¡âš¡âš¡",   # 4 lightning bolts
-        "quality": "â­â­â­",  # 3 stars for quality
+        "speed": "Hastighet: Hög",
+        "quality": "Kvalitet: Medel",
     }
 }
 DEFAULT_EMBEDDING_MODEL = "bge-base"
@@ -153,122 +168,121 @@ WRITING_FORMATS = {
 WRITING_TONES = {
     "neutral": {"sv": "Neutral", "en": "Neutral"},
     "investigative": {"sv": "Granskande", "en": "Investigative"},
-    "narrative": {"sv": "Berattande", "en": "Narrative"},
+    "narrative": {"sv": "Berättande", "en": "Narrative"},
     "formal": {"sv": "Formell", "en": "Formal"},
-    "literary": {"sv": "Litterar", "en": "Literary"},
+    "literary": {"sv": "Litterär", "en": "Literary"},
     "poetic": {"sv": "Poetisk", "en": "Poetic"},
-    "immersive": {"sv": "Narmvar", "en": "Immersive"},
+    "immersive": {"sv": "Närvarande", "en": "Immersive"},
 }
 WRITING_LENGTHS = {
     "short": {"sv": "Kort", "en": "Short", "words": 400},
     "medium": {"sv": "Medel", "en": "Medium", "words": 800},
-    "long": {"sv": "Lang", "en": "Long", "words": 1500},
+    "long": {"sv": "Lång", "en": "Long", "words": 1500},
 }
 
 LANGUAGES = {
     "sv": {
-        "title": "Insikt â€“ Journalist-AI",
-        "welcome": "VÃ¤lkommen till Insikt",
-        "howto": "Ladda upp PDF-filer i sidofÃ¤ltet och chatta sedan med dem nedan. Assistenten kan svara pÃ¥ frÃ¥gor, sammanfatta och analysera dina dokument. Alla svar Ã¤r baserade pÃ¥ dina dokument nÃ¤r mÃ¶jligt, med kÃ¤llhÃ¤nvisning.",
+        "title": "Insikt – Journalist-AI",
+        "welcome": "Välkommen till Insikt",
+        "howto": "Ladda upp filer i sidofältet och chatta sedan med dem nedan. Assistenten kan svara på frågor, sammanfatta och analysera dina dokument. Alla svar är baserade på dina dokument när möjligt, med källhänvisning.",
         "upload": "Ladda upp dokument",
         "process_btn": "Bearbeta dokument",
-        "processing": "Bearbetar... VÃ¤nligen vÃ¤nta. Inga andra Ã¥tgÃ¤rder Ã¤r mÃ¶jliga just nu.",
-        "success_docs": "âœ… {} dokument laddade ({} stycken).",
-        "error_no_docs": "Ladda upp dokument fÃ¶rst.",
-        "knowledge_ready": "âœ… Kunskapsbas redo.",
-        "chunks_loaded": "ðŸ“š {} stycken inlÃ¤sta frÃ¥n {} dokument.",
-        "chat_title": "ðŸ’¬ Chatta med dina dokument",
-        "chat_input": "StÃ¤ll en frÃ¥ga...",
-        "sources": "ðŸ“š KÃ¤llor",
-        "summarize_title": "ðŸ“ Sammanfattningsverktyg",
+        "processing": "Bearbetar... Vänligen vänta. Inga andra åtgärder är möjliga just nu.",
+        "success_docs": "{} dokument laddade ({} stycken).",
+        "error_no_docs": "Ladda upp dokument först.",
+        "knowledge_ready": "Kunskapsbas redo.",
+        "chunks_loaded": "{} stycken inlästa från {} dokument.",
+        "chat_title": "Chatta med dina dokument",
+        "chat_input": "Ställ en fråga...",
+        "sources": "Källor",
+        "summarize_title": "Sammanfattningsverktyg",
         "summarize_btn": "Generera sammanfattning",
         "focus": "Fokus / instruktioner",
-        "target_pages": "MÃ¥lsidor fÃ¶r sammanfattning",
+        "target_pages": "Målsidor för sammanfattning",
         "density": "Ord per sida",
         "style": "Utmatningsstil",
-        "refine_btn": "AnvÃ¤nd fÃ¶rfinad metod (bÃ¤ttre fÃ¶r lÃ¥nga dokument)",
+        "refine_btn": "Använd förfinad metod (bättre för långa dokument)",
         "summarizing": "Sammanfattar...",
-        "success_summary": "âœ… Sammanfattning klar.",
-        "analysis_title": "ðŸ” Analysverktyg",
-        "ner_extract": "ðŸ·ï¸ Extrahera enheter",
-        "timeline": "ðŸ“… Skapa tidslinje",
-        "keywords": "ðŸ”‘ Extrahera nyckelord",
-        "sentiment": "ðŸ“Š Analysera sentiment",
-        "export_title": "ðŸ“¤ Exportera",
-        "bias_check": "âš–ï¸ Kontrollera partiskhet",
-        "translate": "ðŸŒ Ã–versÃ¤tt till",
-        "session_title": "ðŸ’¾ Session",
+        "success_summary": "Sammanfattning klar.",
+        "analysis_title": "Analysverktyg",
+        "ner_extract": "Extrahera enheter",
+        "timeline": "Skapa tidslinje",
+        "keywords": "Extrahera nyckelord",
+        "sentiment": "Analysera sentiment",
+        "export_title": "Exportera",
+        "bias_check": "Kontrollera partiskhet",
+        "translate": "Översätt till",
+        "session_title": "Session",
         "save_session": "Spara session",
         "load_session": "Ladda session",
-        "settings": "âš™ï¸ InstÃ¤llningar",
-        "language": "SprÃ¥k",
+        "settings": "Inställningar",
+        "language": "Språk",
         "device": "Processor (GPU/CPU)",
-        "device_auto": "Auto â€“ anvÃ¤nd GPU om tillgÃ¤ngligt, annars CPU",
-        "device_cuda": "GPU â€“ tvinga GPU (krÃ¤ver NVIDIA GPU med CUDA)",
-        "device_cpu": "CPU â€“ tvinga CPU (lÃ¥ngsammare, men fungerar alltid)",
+        "device_auto": "Auto – använd GPU om tillgängligt, annars CPU",
+        "device_cuda": "GPU – tvinga GPU (kräver NVIDIA GPU med CUDA)",
+        "device_cpu": "CPU – tvinga CPU (långsammare, men fungerar alltid)",
         "device_current": "Aktuell processor: {}",
-        "device_warning_cuda_unavailable": "Varning: Ingen GPU hittades. KÃ¶r pÃ¥ CPU.",
-        "device_info": "GPU Ã¤r mycket snabbare fÃ¶r AI-arbete, men krÃ¤ver ett kompatibelt NVIDIA-kort med CUDA installerat. CPU fungerar alltid men Ã¤r lÃ¥ngsammare.",
-        "ollama_gpu_note": "Ollama mÃ¥ste konfigureras separat fÃ¶r GPU. Se Ollamas dokumentation.",
-        "summary_in_progress": "En sammanfattning pÃ¥gÃ¥r.",
-        "summary_will_continue": "Sammanfattningen fortsÃ¤tter pÃ¥ originalsprÃ¥ket.",
-        "error_ollama": "Kunde inte ansluta till Ollama. Kontrollera att Ollama kÃ¶rs (```ollama serve```) och att modellen '{}' Ã¤r nedladdad.",
-        "error_gpu_memory": "GPU-minnet Ã¤r otillrÃ¤ckligt. FÃ¶rsÃ¶k med fÃ¤rre eller kortare dokument, eller kÃ¶r pÃ¥ CPU.",
-        "error_pdf_corrupt": "En eller flera PDF-filer Ã¤r skadade eller olÃ¤sbara.",
-        "embedding_model": "InbÃ¤ddningsmodell",
-        "embedding_model_info": "BGE-modeller ger bÃ¤ttre semantisk fÃ¶rstÃ¥else Ã¤n MiniLM",
-        "hero_subtitle": "Lokalt AI-stod for granskande journalistik, manus och redaktionellt arbete.",
+        "device_warning_cuda_unavailable": "Varning: Ingen GPU hittades. Kör på CPU.",
+        "device_info": "GPU är mycket snabbare för AI-arbete, men kräver ett kompatibelt NVIDIA-kort med CUDA installerat. CPU fungerar alltid men är långsammare.",
+        "ollama_gpu_note": "Ollama måste konfigureras separat för GPU. Se Ollamas dokumentation.",
+        "summary_in_progress": "En sammanfattning pågår.",
+        "summary_will_continue": "Sammanfattningen fortsätter på originalspråket.",
+        "error_ollama": "Kunde inte ansluta till Ollama. Kontrollera att Ollama körs (```ollama serve```) och att modellen '{}' är nedladdad.",
+        "error_gpu_memory": "GPU-minnet är otillräckligt. Försök med färre eller kortare dokument, eller kör på CPU.",
+        "error_pdf_corrupt": "En eller flera PDF-filer är skadade eller oläsbara.",
+        "embedding_model": "Inbäddningsmodell",
+        "embedding_model_info": "BGE-modeller ger bättre semantisk förståelse än MiniLM",
+        "hero_subtitle": "Lokalt AI-stöd för granskande journalistik, manus och redaktionellt arbete.",
         "hero_badge_local": "100% lokalt",
         "hero_badge_private": "Privat",
         "hero_badge_bilingual": "Svenska/English",
-        "upload_help": "Valj PDF, DOCX, TXT eller MD",
-        "llm_model": "Sprakmodell",
-        "llm_model_info": "Valj balans mellan hastighet och kvalitet.",
+        "upload_help": "Välj PDF, DOCX, TXT eller MD",
+        "llm_model": "Språkmodell",
+        "llm_model_info": "Välj balans mellan hastighet och kvalitet.",
         "chunking": "Segmentering",
-        "chunking_info": "Smart segmentering ger battre sammanhang.",
-        "summary_settings": "Sammanfattningsinstallningar",
-        "summary_estimate": "Uppskattad langd",
-        "summary_help": "Bygg en sammanfattning med tydlig struktur och kallar.",
-        "chat_help": "Stall fragor om dokumenten eller be om forslag.",
+        "chunking_info": "Smart segmentering ger bättre sammanhang.",
+        "summary_settings": "Sammanfattningsinställningar",
+        "summary_estimate": "Uppskattad längd",
+        "summary_help": "Bygg en sammanfattning med tydlig struktur och källor.",
+        "chat_help": "Ställ frågor om dokumenten eller be om förslag.",
         "writing_title": "Skrivstudio",
         "writing_brief": "Uppdrag / brief",
-        "writing_placeholder": "Beskriv vad du vill skapa och for vem...",
+        "writing_placeholder": "Beskriv vad du vill skapa och för vem...",
         "writing_role": "Roll",
         "writing_format": "Format",
         "writing_tone": "Ton",
-        "writing_length": "Langd",
-        "writing_use_sources": "Anvand dokument som kallar",
+        "writing_length": "Längd",
+        "writing_use_sources": "Använd dokument som källor",
         "writing_generate": "Skapa manus",
         "writing_result": "Utkast",
-        "writing_help": "Anvand dokumenten som faktabas nar det gar.",
-        "writing_sources": "Kallor anvanda",
-        "writing_pipeline": "Dokumentar-pipeline",
+        "writing_help": "Använd dokumenten som faktabas när det går.",
+        "writing_sources": "Källor använda",
+        "writing_pipeline": "Dokumentär-pipeline",
         "writing_pipeline_help": "Skapa en disposition, scenlista och slutligt manus i tre steg.",
-        # Document processing progress messages
-        "progress_reading": "LÃ¤ser dokument",
+        "progress_reading": "Läser dokument",
         "progress_chunking": "Delar upp i segment",
         "progress_indexing": "Bygger kunskapsbas",
         "progress_embedding": "Skapar semantiska vektorer",
-        "progress_complete": "Klart!",
-        "stage_reading": "LÃ¤ser dokument {} av {}",
+        "progress_complete": "Klart.",
+        "stage_reading": "Läser dokument {} av {}",
         "stage_chunking": "Delar upp dokument i {} segment",
-        "stage_embedding": "Skapar vektorer fÃ¶r {} segment",
+        "stage_embedding": "Skapar vektorer för {} segment",
     },
     "en": {
-        "title": "Insikt â€“ Journalist AI",
+        "title": "Insikt – Journalist AI",
         "welcome": "Welcome to Insikt",
-        "howto": "Upload PDFs in the sidebar, then chat with them below. The assistant can answer questions, summarize, and analyze your documents. All responses are grounded in your documents when possible, with sources cited.",
+        "howto": "Upload files in the sidebar, then chat with them below. The assistant can answer questions, summarize, and analyze your documents. All responses are grounded in your documents when possible, with sources cited.",
         "upload": "Upload Documents",
         "process_btn": "Process Documents",
         "processing": "Processing... Please wait. No other actions are possible at this time.",
-        "success_docs": "âœ… {} docs loaded ({} chunks).",
+        "success_docs": "{} docs loaded ({} chunks).",
         "error_no_docs": "Please upload documents first.",
-        "knowledge_ready": "âœ… Knowledge base ready.",
-        "chunks_loaded": "ðŸ“š {} chunks loaded from {} documents.",
-        "chat_title": "ðŸ’¬ Chat with Your Documents",
+        "knowledge_ready": "Knowledge base ready.",
+        "chunks_loaded": "{} chunks loaded from {} documents.",
+        "chat_title": "Chat with Your Documents",
         "chat_input": "Ask a question...",
-        "sources": "ðŸ“š Sources",
-        "summarize_title": "ðŸ“ Summarization Tool",
+        "sources": "Sources",
+        "summarize_title": "Summarization Tool",
         "summarize_btn": "Generate Summary",
         "focus": "Focus / instructions",
         "target_pages": "Target pages for summary",
@@ -276,24 +290,24 @@ LANGUAGES = {
         "style": "Output style",
         "refine_btn": "Use refine method (better for long docs)",
         "summarizing": "Summarizing...",
-        "success_summary": "âœ… Summary complete.",
-        "analysis_title": "ðŸ” Analysis Tools",
-        "ner_extract": "ðŸ·ï¸ Extract Entities",
-        "timeline": "ðŸ“… Generate Timeline",
-        "keywords": "ðŸ”‘ Extract Keywords",
-        "sentiment": "ðŸ“Š Analyze Sentiment",
-        "export_title": "ðŸ“¤ Export",
-        "bias_check": "âš–ï¸ Bias Check",
-        "translate": "ðŸŒ Translate to",
-        "session_title": "ðŸ’¾ Session",
+        "success_summary": "Summary complete.",
+        "analysis_title": "Analysis Tools",
+        "ner_extract": "Extract Entities",
+        "timeline": "Generate Timeline",
+        "keywords": "Extract Keywords",
+        "sentiment": "Analyze Sentiment",
+        "export_title": "Export",
+        "bias_check": "Bias Check",
+        "translate": "Translate to",
+        "session_title": "Session",
         "save_session": "Save Session",
         "load_session": "Load Session",
-        "settings": "âš™ï¸ Settings",
+        "settings": "Settings",
         "language": "Language",
         "device": "Processing device",
-        "device_auto": "Auto â€“ use GPU if available, otherwise CPU",
-        "device_cuda": "GPU â€“ force GPU (requires NVIDIA GPU with CUDA)",
-        "device_cpu": "CPU â€“ force CPU (slower, but always works)",
+        "device_auto": "Auto – use GPU if available, otherwise CPU",
+        "device_cuda": "GPU – force GPU (requires NVIDIA GPU with CUDA)",
+        "device_cpu": "CPU – force CPU (slower, but always works)",
         "device_current": "Current device: {}",
         "device_warning_cuda_unavailable": "Warning: No GPU found. Running on CPU.",
         "device_info": "GPU is much faster for AI workloads, but requires a compatible NVIDIA card with CUDA installed. CPU works everywhere but is slower.",
@@ -332,24 +346,24 @@ LANGUAGES = {
         "writing_sources": "Sources used",
         "writing_pipeline": "Documentary pipeline",
         "writing_pipeline_help": "Generate outline, scene list, and final script in three steps.",
-        # Document processing progress messages
         "progress_reading": "Reading documents",
         "progress_chunking": "Chunking documents",
         "progress_indexing": "Building knowledge base",
         "progress_embedding": "Creating semantic vectors",
-        "progress_complete": "Complete!",
+        "progress_complete": "Complete.",
         "stage_reading": "Reading document {} of {}",
         "stage_chunking": "Chunking into {} segments",
         "stage_embedding": "Creating vectors for {} segments",
     }
 }
 
+
 # -------------------------------------------------------------------
 # Helper functions (now deviceâ€‘aware)
 # -------------------------------------------------------------------
 def get_text(key):
     lang = st.session_state.get("lang", "sv")
-    return LANGUAGES[lang].get(key, key)
+    return cleaned_ui_text(LANGUAGES[lang].get(key, key))
 
 def resolve_device(choice):
     """Return actual device string based on user choice."""
@@ -506,7 +520,7 @@ def semantic_chunking(pages, embeddings, status_text, threshold=0.5):
         return splitter.split_documents(pages)
     
     # Generate embeddings for all sentences
-    status_text.text("BerÃ¤knar semantisk likhet..." if st.session_state.get("lang","sv")=="sv" else "Calculating semantic similarity...")
+    status_text.text("Beräknar semantisk likhet..." if st.session_state.get("lang","sv")=="sv" else "Calculating semantic similarity...")
     
     # Batch embed for efficiency
     texts_to_embed = [s["text"] for s in all_sentences]
@@ -607,7 +621,7 @@ def process_uploaded_files(uploaded_files, progress_bar, status_text, chunking_s
             status_text.text(f"{get_text('progress_reading')} ({i+1}/{total_files})")
     
     if not pages_list:
-        st.error("Inga sidor kunde laddas fran filerna." if st.session_state.lang=="sv" else "No pages could be loaded from the files.")
+        st.error("Inga sidor kunde laddas från filerna." if st.session_state.lang=="sv" else "No pages could be loaded from the files.")
         return []
     
     status_text.text(get_text("progress_chunking"))
@@ -698,9 +712,9 @@ class SummaryThread(threading.Thread):
             source = doc.metadata.get("source", "Unknown")
             page = doc.metadata.get("page", "?")
             if self.lang == "sv":
-                entry = f"[Fran {source}, sida {page}]: {doc.page_content}\\n\\n"
+                entry = f"[Från {source}, sida {page}]: {doc.page_content}\n\n"
             else:
-                entry = f"[From {source}, page {page}]: {doc.page_content}\\n\\n"
+                entry = f"[From {source}, page {page}]: {doc.page_content}\n\n"
             if current and (current_chars + len(entry) > max_chars or len(current) >= max_chunks):
                 batches.append("".join(current))
                 current = []
@@ -723,7 +737,7 @@ class SummaryThread(threading.Thread):
                         0,
                         0,
                         5,
-                        "Malslangd kapad for att matcha modellens grans." if self.lang == "sv" else "Target length capped to fit model limits."
+                        "Målslängd kapad för att matcha modellens gräns." if self.lang == "sv" else "Target length capped to fit model limits."
                     )
 
             num_predict = min(max(int(target_words * 1.3), 512), 4096)
@@ -733,26 +747,26 @@ class SummaryThread(threading.Thread):
             batches = self._build_batches()
 
             if self.lang == "sv":
-                map_template = """Du ar en undersokande journalist. Skapa en detaljerad sammanfattning av foljande textavsnitt med fokus pa: {focus}.
-Stil: {style}. Inkludera viktiga fakta, namn, datum och sidhanvisningar.
+                map_template = """Du är en undersökande journalist. Skapa en detaljerad sammanfattning av följande textavsnitt med fokus på: {focus}.
+Stil: {style}. Inkludera viktiga fakta, namn, datum och sidhänvisningar.
 Textavsnitt: {text}
 
 Detaljerad sammanfattning av detta avsnitt:"""
 
-                reduce_template = """Du ar en journalist och redaktor. Kombinera foljande separata sammanfattningar till en sammanhangande helhet pa ungefar {target_words} ord.
+                reduce_template = """Du är en journalist och redaktör. Kombinera följande separata sammanfattningar till en sammanhängande helhet på ungefär {target_words} ord.
 Fokus: {focus}. Stil: {style}.
-Bevara viktiga fakta, namn, datum och kallhanvisningar.
+Bevara viktiga fakta, namn, datum och källhänvisningar.
 
 Sammanfattningar att kombinera:
 {existing_summaries}
 
 Kombinerad sammanfattning:"""
 
-                final_prompt = f"""Du ar en journalist och redaktor. Forfina foljande sammanfattning till en slutlig, polerad version pa ungefar {target_words} ord.
+                final_prompt = f"""Du är en journalist och redaktör. Förfina följande sammanfattning till en slutlig, polerad version på ungefär {target_words} ord.
 Stil: {{style}}. Fokus: {{focus}}.
-Inkludera kallhanvisningar [Kalla: filnamn, sida X] dar mojligt.
+Inkludera källhänvisningar [Källa: filnamn, sida X] där möjligt.
 
-Sammanfattning att forfina:
+Sammanfattning att förfina:
 {{current_summary}}
 
 Slutlig sammanfattning:"""
@@ -861,7 +875,7 @@ Final summary:"""
                         total_batches,
                         total_batches,
                         95,
-                        "Fardigstaller..." if self.lang == "sv" else "Finalizing..."
+                        "Färdigställer..." if self.lang == "sv" else "Finalizing..."
                     )
                 try:
                     final_prompt_text = final_prompt.format(
@@ -883,7 +897,7 @@ Final summary:"""
                 sources_list = _build_sources_list(self.docs, self.lang)
                 self.result = _citation_fix(self.result, self.lang, llm, sources_list)
                 if not _has_citations(self.result, self.lang):
-                    warning = "\n\nOBS: Kallor kunde inte verifieras." if self.lang == "sv" else "\n\nNote: Citations could not be verified."
+                    warning = "\n\nOBS: K?llor kunde inte verifieras." if self.lang == "sv" else "\n\nNote: Citations could not be verified."
                     self.result += warning
         except Exception as e:
             self.error = str(e)
@@ -998,18 +1012,18 @@ def retrieve_context(query, vectorstore, k=7):
 def create_chat_prompt(history, context_docs, query, lang):
     if lang == "sv":
         system_template = """
-Du Ã¤r en hjÃ¤lpsam, Ã¤rlig AI-assistent. Du kan komma Ã¥t anvÃ¤ndarens uppladdade dokument fÃ¶r att svara pÃ¥ frÃ¥gor.
-NÃ¤r du anvÃ¤nder information frÃ¥n dokumenten MÃ…STE du ange kÃ¤llan (filnamn och sidnummer) i ditt svar.
-Om anvÃ¤ndarens frÃ¥ga inte Ã¤r relaterad till dokumenten eller du inte hittar relevant information, kan du svara baserat pÃ¥ din allmÃ¤nna kunskap, men ange tydligt att du inte anvÃ¤nder dokumenten.
-Var alltid sanningsenlig och hitta inte pÃ¥ information.
+Du är en hjälpsam och ärlig AI-assistent. Du kan använda användarens uppladdade dokument för att svara på frågor.
+När du använder information från dokumenten MÅSTE du ange källa (filnamn och sidnummer) i svaret.
+Om frågan inte rör dokumenten eller om du inte hittar relevant information kan du svara utifrån allmän kunskap, men säg tydligt att du inte använder dokumenten.
+Var alltid sanningsenlig och hitta inte på information.
 
-Kontext frÃ¥n dokument:
+Kontext från dokument:
 {context}
 
-Konversationshistorik:
+Tidigare konversation:
 {history}
 
-AnvÃ¤ndare: {query}
+Användare: {query}
 Assistent:"""
     else:
         system_template = """
@@ -1078,27 +1092,27 @@ def create_writing_prompt(brief, role_key, format_key, tone_key, length_key, lan
             src = doc.metadata.get("source", "Unknown")
             page = doc.metadata.get("page", "?")
             if lang == "sv":
-                context_str += f"[Kalla: {src}, sida {page}]: {doc.page_content}\n\n"
+                context_str += f"[Källa: {src}, sida {page}]: {doc.page_content}\n\n"
             else:
                 context_str += f"[Source: {src}, page {page}]: {doc.page_content}\n\n"
 
     if lang == "sv":
-        prompt = f"""Du ar en {role_label}. Skapa ett utkast i formatet {format_label}.
-Ton: {tone_label}. Mal: cirka {length_words} ord.
+        prompt = f"""Du är en {role_label}. Skapa ett utkast i formatet {format_label}.
+Ton: {tone_label}. Mållängd: cirka {length_words} ord.
 
 Uppdrag:
 {brief}
 
-Om fakta fran dokumenten anvands, inkludera kallhanvisningar [Kalla: filnamn, sida X].
-Om du saknar fakta, markera tydligt vad som ar antagande.
+När du använder fakta från dokument, inkludera källhänvisningar [Källa: filnamn, sida X].
+Om fakta saknas, markera antaganden tydligt.
 
-Kallor:
-{context_str if context_str else 'Inga kallsnuttar tillgangliga.'}
+Källor:
+{context_str if context_str else 'Inga källutdrag tillgängliga.'}
 
-Leverans:
+Leverera:
 1) Kort disposition
 2) Utkast/manus med tydlig struktur
-3) Lista med kalla-forlag om nagot behovs"""
+3) Lista över saknade källor om något behöver verifieras"""
     else:
         prompt = f"""You are a {role_label}. Create a draft in the format {format_label}.
 Tone: {tone_label}. Target length: about {length_words} words.
@@ -1121,7 +1135,7 @@ Deliver:
 
 def _has_citations(text, lang):
     if lang == "sv":
-        return bool(re.search(r"\[Kalla:\s*[^\]]+\]", text))
+        return bool(re.search(r"\[Källa:\s*[^\]]+\]", text))
     return bool(re.search(r"\[Source:\s*[^\]]+\]", text))
 
 
@@ -1129,14 +1143,14 @@ def _citation_fix(text, lang, llm, sources_list):
     if not sources_list:
         return text
     if lang == "sv":
-        prompt = f"""Du ar en redaktor. Lagg till tydliga kallhanvisningar i texten.
-Anvand endast denna lista over kallor:
+        prompt = f"""Du ?r en redakt?r. L?gg till tydliga k?llh?nvisningar i texten.
+Anv?nd endast denna lista ?ver k?llor:
 {sources_list}
 
 Text:
 {text}
 
-Uppdaterad text med kallor:"""
+Uppdaterad text med k?llor:"""
     else:
         prompt = f"""You are an editor. Add clear citations to the text.
 Use only this list of sources:
@@ -1178,9 +1192,9 @@ def generate_writing(brief, role_key, format_key, tone_key, length_key, lang, ve
         if use_pipeline and format_key == "documentary":
             outline_prompt = prompt + ("\n\nSteg 1: Skapa en tydlig disposition." if lang == "sv" else "\n\nStep 1: Create a clear outline.")
             outline = llm.invoke(outline_prompt).content
-            scene_prompt = ("\n\nSteg 2: Skapa en scenlista baserat pa dispositionen:\n" if lang == "sv" else "\n\nStep 2: Create a scene list based on the outline:\n") + outline
+            scene_prompt = ("\n\nSteg 2: Skapa en scenlista baserat p? dispositionen:\n" if lang == "sv" else "\n\nStep 2: Create a scene list based on the outline:\n") + outline
             scenes = llm.invoke(scene_prompt).content
-            script_prompt = ("\n\nSteg 3: Skriv slutligt manus baserat pa scenlistan:\n" if lang == "sv" else "\n\nStep 3: Write the final script based on the scene list:\n") + scenes
+            script_prompt = ("\n\nSteg 3: Skriv slutligt manus baserat p? scenlistan:\n" if lang == "sv" else "\n\nStep 3: Write the final script based on the scene list:\n") + scenes
             response = llm.invoke(script_prompt).content
             response = f"{outline}\n\n{scenes}\n\n{response}"
         else:
@@ -1191,7 +1205,7 @@ def generate_writing(brief, role_key, format_key, tone_key, length_key, lang, ve
     if use_sources and context_docs and not _has_citations(response, lang):
         response = _citation_fix(response, lang, llm, sources_list)
         if not _has_citations(response, lang):
-            warning = "\n\nOBS: Kallor kunde inte verifieras." if lang == "sv" else "\n\nNote: Citations could not be verified."
+            warning = "\n\nOBS: K?llor kunde inte verifieras." if lang == "sv" else "\n\nNote: Citations could not be verified."
             response += warning
     return response, context_docs
 
@@ -1339,9 +1353,9 @@ def verify_citations(response: str, context_docs: list, lang: str) -> tuple:
     if issues:
         warning_msg = ""
         if lang == "sv":
-            warning_msg = "\n\nâš ï¸ *Obs: Vissa kÃ¤llhÃ¤nvisningar kunde inte verifieras i dokumentkontexten.*"
+            warning_msg = "\n\nObs: Vissa källhänvisningar kunde inte verifieras i dokumentkontexten."
         else:
-            warning_msg = "\n\nâš ï¸ *Note: Some citations could not be verified in the document context.*"
+            warning_msg = "\n\nNote: Some citations could not be verified in the document context."
         
         response = response + warning_msg
     
@@ -1622,6 +1636,106 @@ def set_custom_css():
     </style>
     """, unsafe_allow_html=True)
 
+
+SummaryThread = ModularSummaryThread
+generate_doc_hash = modular_generate_doc_hash
+
+
+@st.cache_data(show_spinner=False)
+def get_startup_checks(model_key: str, embedding_key: str):
+    return run_startup_checks(model_key, embedding_key)
+
+
+def set_status(status_placeholder, message):
+    status_placeholder.text(cleaned_ui_text(message))
+
+
+def refresh_source_options():
+    raw_pages = st.session_state.get("raw_pages") or []
+    st.session_state.available_sources = sorted({doc.metadata.get("source", "Unknown") for doc in raw_pages})
+
+
+def ingest_uploaded_files(uploaded_files):
+    st.session_state.processing = True
+    try:
+        embeddings = load_embeddings(st.session_state.device_choice, st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
+        progress = st.progress(0.0)
+        status = st.empty()
+        fingerprint, raw_pages, chunks = cached_process_uploaded_files(
+            uploaded_files,
+            embeddings=embeddings,
+            cache_root=CACHE_ROOT,
+            chunking_strategy=st.session_state.get("chunking_strategy", DEFAULT_CHUNKING),
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            status_callback=lambda msg: set_status(status, msg),
+            progress_callback=lambda value: progress.progress(min(value, 1.0)),
+            error_callback=lambda file_name: st.error(f"{get_text('error_pdf_corrupt')} ({file_name})"),
+        )
+        vectorstore = build_or_load_vectorstore(fingerprint, chunks, embeddings, CACHE_ROOT, status_callback=lambda msg: set_status(status, msg))
+        st.session_state.raw_pages = raw_pages
+        st.session_state.docs = chunks
+        st.session_state.vectorstore = vectorstore
+        st.session_state.doc_fingerprint = fingerprint
+        st.session_state.chat_history = []
+        refresh_source_options()
+        st.success(get_text("success_docs").format(len(uploaded_files), len(chunks)))
+    finally:
+        st.session_state.processing = False
+
+
+def rebuild_from_current_pages():
+    raw_pages = st.session_state.get("raw_pages") or []
+    if not raw_pages:
+        st.session_state.docs = None
+        st.session_state.vectorstore = None
+        st.session_state.doc_fingerprint = ""
+        refresh_source_options()
+        return
+    embeddings = load_embeddings(st.session_state.device_choice, st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
+    chunks = rechunk_pages(
+        raw_pages,
+        embeddings,
+        chunking_strategy=st.session_state.get("chunking_strategy", DEFAULT_CHUNKING),
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
+    fingerprint = modular_generate_doc_hash(raw_pages)
+    st.session_state.docs = chunks
+    st.session_state.vectorstore = build_or_load_vectorstore(fingerprint, chunks, embeddings, CACHE_ROOT)
+    st.session_state.doc_fingerprint = fingerprint
+    refresh_source_options()
+
+
+def remove_source(source_name: str):
+    st.session_state.raw_pages = [doc for doc in (st.session_state.get("raw_pages") or []) if doc.metadata.get("source") != source_name]
+    st.session_state.chat_history = []
+    rebuild_from_current_pages()
+
+
+def apply_loaded_slot(payload: dict):
+    st.session_state.docs = payload.get("docs") or []
+    st.session_state.raw_pages = payload.get("raw_pages") or []
+    st.session_state.chat_history = payload.get("chat_history") or []
+    st.session_state.last_summary = payload.get("last_summary", "")
+    st.session_state.vectorstore = payload.get("vectorstore")
+    st.session_state.lang = payload.get("lang", st.session_state.get("lang", "sv"))
+    st.session_state.doc_fingerprint = payload.get("fingerprint", "")
+    refresh_source_options()
+
+
+def copy_block(text: str, key: str):
+    escaped = text.replace("\\", "\\\\").replace("`", "\\`").replace("</", "<\\/")
+    components.html(
+        f"""
+        <button onclick="navigator.clipboard.writeText(`{escaped}`)" style="padding:0.45rem 0.8rem;border:1px solid #d6d3d1;border-radius:8px;background:#fff;cursor:pointer;">
+            Copy
+        </button>
+        """,
+        height=42,
+        key=key,
+    )
+
 # -------------------------------------------------------------------
 # Main app
 # -------------------------------------------------------------------
@@ -1629,16 +1743,17 @@ def main():
     st.set_page_config(page_title=APP_NAME, layout="wide")
     set_custom_css()
 
-    # Initialize session state
     defaults = {
         "docs": None,
+        "raw_pages": [],
         "vectorstore": None,
         "chat_history": [],
         "last_summary": "",
         "lang": "sv",
-        "device_choice": "auto",  # default
-        "llm_model": DEFAULT_LLM_MODEL,  # Quantized model default
-        "chunking_strategy": DEFAULT_CHUNKING,  # Semantic chunking default
+        "device_choice": "auto",
+        "llm_model": DEFAULT_LLM_MODEL,
+        "embedding_model": DEFAULT_EMBEDDING_MODEL,
+        "chunking_strategy": DEFAULT_CHUNKING,
         "processing": False,
         "summary_running": False,
         "summary_thread": None,
@@ -1646,15 +1761,12 @@ def main():
         "summary_total": 0,
         "summary_result": None,
         "summary_error": None,
-        # New UX improvements - detailed progress tracking
-        "summary_stage": "idle",  # idle, reading, processing, combining, polishing, complete, error, cancelled
-        "summary_stages_log": [],  # List of all stage changes with timestamps
+        "summary_stage": "idle",
+        "summary_stages_log": [],
         "summary_current_batch": 0,
         "summary_total_batches": 0,
         "summary_percentage": 0,
         "summary_cancel_requested": False,
-        "summary_start_time": None,
-        "summary_stage_duration": 0,
         "summary_focus": "",
         "summary_target_pages": 5,
         "summary_words_per_page": 300,
@@ -1669,223 +1781,146 @@ def main():
         "writing_pipeline": False,
         "writing_result": "",
         "writing_sources": [],
+        "available_sources": [],
+        "chat_source_filter": [],
+        "writing_source_filter": [],
+        "selected_preview_source": "",
+        "selected_preview_page": "",
+        "save_slot_name": "",
+        "doc_fingerprint": "",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
-    # Check if summary thread finished
     check_summary_status()
+    refresh_source_options()
+    lang = st.session_state.lang
+    checks = get_startup_checks(st.session_state.get("llm_model", DEFAULT_LLM_MODEL), st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
+    readiness_state, readiness_text = app_readiness_label(st.session_state.get("docs"), st.session_state.get("processing", False))
 
-    # Sidebar
     with st.sidebar:
         st.markdown(f"## {get_text('title')}")
         current_device = resolve_device(st.session_state.device_choice)
-        st.caption(f"Körs på **{current_device.upper()}**" if st.session_state.lang == "sv" else f"Running on **{current_device.upper()}**")
-        st.divider()
+        if readiness_state == "ready":
+            st.success("Kunskapsbas redo" if lang == "sv" else readiness_text)
+        elif readiness_state == "processing":
+            st.info("Bearbetning p?g?r" if lang == "sv" else readiness_text)
+        else:
+            st.warning("Ingen kunskapsbas laddad" if lang == "sv" else readiness_text)
+        st.caption(get_text("device_current").format(current_device.upper()))
 
-        # Language selector
-        lang = st.selectbox(
-            get_text("language"),
-            options=["sv", "en"],
-            format_func=lambda x: "Svenska" if x == "sv" else "English",
-            key="lang_selector",
-        )
-        if lang != st.session_state.lang:
-            st.session_state.lang = lang
-            st.rerun()
+        with st.expander("Setup", expanded=True):
+            selected_lang = st.selectbox(get_text("language"), options=["sv", "en"], format_func=lambda x: "Svenska" if x == "sv" else "English")
+            if selected_lang != st.session_state.lang:
+                st.session_state.lang = selected_lang
+                st.rerun()
+            selected_device = st.selectbox(get_text("device"), options=["auto", "cuda", "cpu"], format_func=lambda x: get_text(f"device_{x}"))
+            if selected_device != st.session_state.device_choice:
+                st.session_state.device_choice = selected_device
+                st.rerun()
+            st.caption(get_text("device_info"))
+            st.caption(get_text("ollama_gpu_note"))
+            for check in checks:
+                line = f"{check['name']}: {cleaned_ui_text(check['message'])}"
+                if check["status"] == "warning":
+                    st.warning(line)
+                elif check["status"] == "ok":
+                    st.success(line)
+                else:
+                    st.info(line)
 
-        st.divider()
-
-        # Device selector with explanation
-        st.markdown(f"### {get_text('device')}")
-        st.info(get_text("device_info"))
-        device_choice = st.selectbox(
-            get_text("device"),
-            options=["auto", "cuda", "cpu"],
-            format_func=lambda x: get_text(f"device_{x}"),
-            key="device_selector",
-            help=get_text("ollama_gpu_note")
-        )
-        if device_choice != st.session_state.device_choice:
-            st.session_state.device_choice = device_choice
-            st.rerun()
-
-        effective_device = resolve_device(st.session_state.device_choice)
-        st.caption(get_text("device_current").format(effective_device.upper()))
-
-        st.divider()
-
-        # LLM model selector
-        st.markdown(f"### {get_text('llm_model')}")
-        st.caption(get_text("llm_model_info"))
-
-        def get_llm_display_text(key):
-            model_info = LLM_MODELS.get(key, {})
-            current_lang = st.session_state.get("lang", "sv")
-            display_name = model_info.get("display_name_en" if current_lang == "en" else "display_name", key)
-            description = model_info.get("description_en" if current_lang == "en" else "description", "")
-            speed = model_info.get("speed", "")
-            quality = model_info.get("quality", "")
-            return f"{display_name}  {speed} {quality}  {description}"
-
-        llm_model = st.selectbox(
-            get_text("llm_model"),
-            options=list(LLM_MODELS.keys()),
-            format_func=get_llm_display_text,
-            key="llm_model_selector",
-            index=list(LLM_MODELS.keys()).index(st.session_state.get("llm_model", DEFAULT_LLM_MODEL))
-        )
-        if llm_model != st.session_state.get("llm_model", DEFAULT_LLM_MODEL):
-            st.session_state.llm_model = llm_model
-            st.rerun()
-
-        st.divider()
-
-        # Chunking strategy
-        st.markdown(f"### {get_text('chunking')}")
-        st.caption(get_text("chunking_info"))
-        chunking = st.selectbox(
-            get_text("chunking"),
-            options=list(CHUNKING_STRATEGIES.keys()),
-            format_func=lambda x: CHUNKING_STRATEGIES[x]["display_name_en"] if st.session_state.get("lang", "sv") == "en" else CHUNKING_STRATEGIES[x]["display_name"],
-            key="chunking_selector",
-            index=list(CHUNKING_STRATEGIES.keys()).index(st.session_state.get("chunking_strategy", DEFAULT_CHUNKING))
-        )
-        if chunking != st.session_state.get("chunking_strategy", DEFAULT_CHUNKING):
-            st.session_state.chunking_strategy = chunking
-            st.rerun()
-
-        st.divider()
-
-        # Embedding model selector
-        st.markdown(f"### {get_text('embedding_model')}")
-
-        def get_embedding_display_text(key):
-            model_info = EMBEDDING_MODELS.get(key, {})
-            if isinstance(model_info, dict):
-                current_lang = st.session_state.get("lang", "sv")
-                display_name = model_info.get("display_name_en" if current_lang == "en" else "display_name", key)
-                description = model_info.get("description_en" if current_lang == "en" else "description", "")
-                speed = model_info.get("speed", "")
-                quality = model_info.get("quality", "")
-                return f"{display_name}\\n{speed} {quality}\\n{description}"
-            return key
-
-        embedding_model = st.selectbox(
-            get_text("embedding_model"),
-            options=list(EMBEDDING_MODELS.keys()),
-            format_func=get_embedding_display_text,
-            key="embedding_model_selector",
-            label_visibility="collapsed",
-            index=list(EMBEDDING_MODELS.keys()).index(st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
-        )
-        if embedding_model != st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL):
-            st.session_state.embedding_model = embedding_model
-            st.rerun()
-
-        st.divider()
-
-        # Document upload
-        st.markdown(f"### {get_text('upload')}")
-        uploaded_files = st.file_uploader(
-            " ",
-            type=["pdf", "docx", "txt", "md"],
-            accept_multiple_files=True,
-            disabled=st.session_state.processing,
-            help=get_text("upload_help")
-        )
-
-        if uploaded_files and st.button(get_text("process_btn"), disabled=st.session_state.processing, use_container_width=True):
-            st.session_state.processing = True
-            try:
-                progress = st.progress(0)
-                status = st.empty()
-                chunks = process_uploaded_files(uploaded_files, progress, status)
-                if chunks:
-                    st.session_state.docs = chunks
-                    st.success(get_text("success_docs").format(len(uploaded_files), len(chunks)))
-
-                    progress.progress(0)
-                    status.text(get_text("progress_indexing"))
-                    embeddings = load_embeddings(st.session_state.device_choice)
-                    vs = build_vectorstore(chunks, embeddings, progress, status)
-                    if vs:
-                        st.session_state.vectorstore = vs
-                        status.text(get_text("knowledge_ready"))
-            except Exception as e:
-                st.error(f"Processing failed: {e}")
-            finally:
-                st.session_state.processing = False
+        with st.expander("Models", expanded=True):
+            llm_model = st.selectbox(
+                get_text("llm_model"),
+                options=list(LLM_MODELS.keys()),
+                index=list(LLM_MODELS.keys()).index(st.session_state.get("llm_model", DEFAULT_LLM_MODEL)),
+                format_func=lambda key: concise_model_label(LLM_MODELS.get(key, {}), lang),
+            )
+            if llm_model != st.session_state.get("llm_model", DEFAULT_LLM_MODEL):
+                st.session_state.llm_model = llm_model
+                st.rerun()
+            embedding_model = st.selectbox(
+                get_text("embedding_model"),
+                options=list(EMBEDDING_MODELS.keys()),
+                index=list(EMBEDDING_MODELS.keys()).index(st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL)),
+                format_func=lambda key: concise_model_label(EMBEDDING_MODELS.get(key, {}), lang),
+            )
+            if embedding_model != st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL):
+                st.session_state.embedding_model = embedding_model
+                st.rerun()
+            chunking = st.selectbox(
+                get_text("chunking"),
+                options=list(CHUNKING_STRATEGIES.keys()),
+                index=list(CHUNKING_STRATEGIES.keys()).index(st.session_state.get("chunking_strategy", DEFAULT_CHUNKING)),
+                format_func=lambda key: CHUNKING_STRATEGIES[key]["display_name_en"] if lang == "en" else CHUNKING_STRATEGIES[key]["display_name"],
+            )
+            if chunking != st.session_state.get("chunking_strategy", DEFAULT_CHUNKING):
+                st.session_state.chunking_strategy = chunking
+                if st.session_state.get("raw_pages"):
+                    rebuild_from_current_pages()
                 st.rerun()
 
-        if st.session_state.docs:
-            unique_sources = len(set(d.metadata['source'] for d in st.session_state.docs))
-            st.info(get_text("chunks_loaded").format(len(st.session_state.docs), unique_sources))
+        with st.expander("Files", expanded=True):
+            uploaded_files = st.file_uploader(get_text("upload"), type=["pdf", "docx", "txt", "md"], accept_multiple_files=True, disabled=st.session_state.processing, help=get_text("upload_help"))
+            if uploaded_files and st.button(get_text("process_btn"), disabled=st.session_state.processing, use_container_width=True):
+                ingest_uploaded_files(uploaded_files)
+                st.rerun()
+            if st.session_state.get("docs"):
+                unique_sources = len(set(doc.metadata.get("source", "Unknown") for doc in st.session_state.get("raw_pages", [])))
+                st.info(get_text("chunks_loaded").format(len(st.session_state.docs), unique_sources))
+            for source in st.session_state.get("available_sources", []):
+                col_preview, col_remove = st.columns([3, 1])
+                with col_preview:
+                    if st.button(source, key=f"preview-source-{source}", use_container_width=True):
+                        st.session_state.selected_preview_source = source
+                        st.session_state.selected_preview_page = ""
+                with col_remove:
+                    if st.button("X", key=f"remove-source-{source}", use_container_width=True):
+                        remove_source(source)
+                        st.rerun()
+            st.text_input("Namn p? sparning" if lang == "sv" else "Save name", key="save_slot_name")
+            if st.button("Spara nuvarande l?ge" if lang == "sv" else "Save current slot", use_container_width=True, disabled=st.session_state.processing):
+                if st.session_state.get("docs"):
+                    slot_name = st.session_state.get("save_slot_name") or f"Save {len(list_save_slots(SAVES_ROOT)) + 1}"
+                    slot_id = save_slot(SAVES_ROOT, slot_name, st.session_state.get("docs") or [], st.session_state.get("raw_pages") or [], st.session_state.get("chat_history") or [], st.session_state.get("last_summary", ""), st.session_state.get("lang", "sv"), st.session_state.get("vectorstore"), st.session_state.get("doc_fingerprint", ""))
+                    st.success(f"{'Slot sparad' if lang == 'sv' else 'Slot saved'}: {slot_id}")
+                else:
+                    st.warning("Inget att spara" if lang == "sv" else "Nothing to save")
+            save_slots = list_save_slots(SAVES_ROOT)
+            if save_slots:
+                st.caption("Sparade l?gen" if lang == "sv" else "Saved slots")
+            for slot in save_slots:
+                st.markdown(f"**{slot.get('name', slot.get('slot_id'))}**")
+                st.caption(f"{slot.get('doc_count', 0)} {'segment' if lang == 'sv' else 'chunks'} | {slot.get('updated_at', '')[:19]}")
+                col_load, col_delete = st.columns(2)
+                with col_load:
+                    if st.button("Ladda" if lang == "sv" else "Load", key=f"load-slot-{slot['slot_id']}", use_container_width=True):
+                        embeddings = load_embeddings(st.session_state.device_choice, st.session_state.get("embedding_model", DEFAULT_EMBEDDING_MODEL))
+                        apply_loaded_slot(load_slot(SAVES_ROOT, slot["slot_id"], embeddings))
+                        st.success("Sparning laddad" if lang == "sv" else "Save loaded")
+                        st.rerun()
+                with col_delete:
+                    if st.button("Ta bort" if lang == "sv" else "Delete", key=f"delete-slot-{slot['slot_id']}", use_container_width=True):
+                        delete_slot(SAVES_ROOT, slot["slot_id"])
+                        st.rerun()
+            st.caption("All behandling sker lokalt. Sparningar ligger i session_data/saves." if lang == "sv" else "All processing is local. Saves are stored in session_data/saves.")
 
-        st.divider()
-
-        # Session management
-        with st.expander(get_text("session_title"), expanded=False):
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button(get_text("save_session"), disabled=st.session_state.processing, use_container_width=True):
-                    if st.session_state.vectorstore:
-                        try:
-                            os.makedirs("session_data", exist_ok=True)
-                            st.session_state.vectorstore.save_local("session_data/vectorstore")
-                            with open("session_data/session.pkl", "wb") as f:
-                                pickle.dump({
-                                    "docs": st.session_state.docs,
-                                    "chat_history": st.session_state.chat_history,
-                                    "last_summary": st.session_state.last_summary,
-                                    "lang": st.session_state.lang
-                                }, f)
-                            st.success("Session sparad" if lang == "sv" else "Session saved")
-                        except Exception as e:
-                            st.error(f"Save failed: {e}")
-                    else:
-                        st.warning("Inget att spara" if lang == "sv" else "Nothing to save")
-            with col2:
-                if st.button(get_text("load_session"), disabled=st.session_state.processing, use_container_width=True):
-                    try:
-                        if os.path.exists("session_data/session.pkl"):
-                            embeddings = load_embeddings(st.session_state.device_choice)
-                            vs = FAISS.load_local("session_data/vectorstore", embeddings, allow_dangerous_deserialization=True)
-                            st.session_state.vectorstore = vs
-                            with open("session_data/session.pkl", "rb") as f:
-                                data = pickle.load(f)
-                            st.session_state.docs = data["docs"]
-                            st.session_state.chat_history = data["chat_history"]
-                            st.session_state.last_summary = data["last_summary"]
-                            st.session_state.lang = data["lang"]
-                            st.success("Session laddad" if lang == "sv" else "Session loaded")
-                            st.rerun()
-                        else:
-                            st.error("Ingen sparad session" if lang == "sv" else "No saved session")
-                    except Exception as e:
-                        st.error(f"Load failed: {e}")
-
-        st.caption("All behandling sker lokalt och privat" if lang == "sv" else "All processing is 100% local and private.")
-
-    # Main area
     if st.session_state.processing:
         st.markdown("""
         <div class="processing-overlay">
             <div class="processing-box">
                 <h3>""" + get_text("processing") + """</h3>
                 <div class="stProgress"><div style="width:100%; background:#d97706; height:4px;"></div></div>
-                <p>Var god vanta...</p>
+                <p>Var god v?nta...</p>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
     lang = st.session_state.lang
-
     col_left, col_right = st.columns([3, 2])
     with col_left:
-        st.markdown(
-            f"""
+        st.markdown(f"""
             <div class="hero">
                 <div class="hero-title">{get_text('title')}</div>
                 <div class="hero-subtitle">{get_text('hero_subtitle')}</div>
@@ -1895,217 +1930,119 @@ def main():
                     <span class="chip">{get_text('hero_badge_bilingual')}</span>
                 </div>
             </div>
-            """,
-            unsafe_allow_html=True
-        )
+            """, unsafe_allow_html=True)
     with col_right:
-        st.markdown(
-            f"""
+        preview_source = st.session_state.get("selected_preview_source", "")
+        preview_page = st.session_state.get("selected_preview_page", "")
+        preview_docs = [doc for doc in (st.session_state.get("raw_pages") or []) if doc.metadata.get("source") == preview_source]
+        st.markdown(f"""
             <div class="card">
                 <strong>{'Snabbstart' if lang == 'sv' else 'Quick Start'}</strong>
                 <div style="margin-top: 0.6rem; color: #475569;">
                     1) {'Ladda upp filer och bygg kunskapsbasen' if lang == 'sv' else 'Upload files and build the knowledge base'}<br>
                     2) {'Chatta, sammanfatta eller skriv manus' if lang == 'sv' else 'Chat, summarize, or draft scripts'}<br>
-                    3) {'Exportera eller fortsatt granska' if lang == 'sv' else 'Export or keep investigating'}
+                    3) {'Exportera eller forts?tt granska' if lang == 'sv' else 'Export or keep investigating'}
                 </div>
             </div>
-            """,
-            unsafe_allow_html=True
-        )
+            """, unsafe_allow_html=True)
+        if preview_source and preview_docs:
+            st.markdown("### " + ("Dokumentf?rhandsvisning" if lang == "sv" else "Document Preview"))
+            page_options = [str(doc.metadata.get("page", "?")) for doc in preview_docs]
+            selected_page = st.selectbox("Sida" if lang == "sv" else "Page", options=page_options, index=page_options.index(preview_page) if preview_page in page_options else 0)
+            st.session_state.selected_preview_page = selected_page
+            selected_doc = next((doc for doc in preview_docs if str(doc.metadata.get("page", "?")) == selected_page), preview_docs[0])
+            st.caption(preview_source)
+            st.text_area("Preview", selected_doc.page_content[:2500], height=220)
 
-    tab_labels = [
-        "Chat",
-        "Sammanfatta" if lang == "sv" else "Summary",
-        "Skrivstudio" if lang == "sv" else "Writing Studio",
-        "Analys" if lang == "sv" else "Analysis",
-        "Export"
-    ]
-    tab_chat, tab_summary, tab_write, tab_analysis, tab_export = st.tabs(tab_labels)
+    tab_chat, tab_summary, tab_write, tab_analysis, tab_export = st.tabs(["Chat", "Sammanfatta" if lang == "sv" else "Summary", "Skrivstudio" if lang == "sv" else "Writing Studio", "Analys" if lang == "sv" else "Analysis", "Export"])
 
     with tab_chat:
         st.markdown(f"### {get_text('chat_title')}")
         st.caption(get_text("chat_help"))
-
-        chat_container = st.container()
-        with chat_container:
-            messages_container = st.container()
-            with messages_container:
-                for msg in st.session_state.chat_history:
-                    if msg["role"] == "user":
-                        st.markdown(f'<div class="chat-message user-message">{msg["content"]}</div>', unsafe_allow_html=True)
-                    else:
-                        st.markdown(f'<div class="chat-message assistant-message">{msg["content"]}</div>', unsafe_allow_html=True)
-
-            if prompt := st.chat_input(get_text("chat_input"), disabled=st.session_state.processing):
-                st.session_state.chat_history.append({"role": "user", "content": prompt})
-                st.markdown(f'<div class="chat-message user-message">{prompt}</div>', unsafe_allow_html=True)
-
-                with st.spinner("Tanker..." if lang == "sv" else "Thinking..."):
-                    llm = load_llm(st.session_state.device_choice)
-                    history_lc = []
-                    for msg in st.session_state.chat_history[:-1]:
-                        if msg["role"] == "user":
-                            history_lc.append(HumanMessage(content=msg["content"]))
-                        else:
-                            history_lc.append(AIMessage(content=msg["content"]))
-
-                    answer, sources = chat_with_docs(
-                        prompt,
-                        history_lc,
-                        st.session_state.vectorstore,
-                        llm,
-                        st.session_state.lang
-                    )
-
-                st.session_state.chat_history.append({"role": "assistant", "content": answer})
-                st.markdown(f'<div class="chat-message assistant-message">{answer}</div>', unsafe_allow_html=True)
-
-                if sources:
-                    with st.expander(get_text("sources")):
-                        for doc in sources[:5]:
-                            src = doc.metadata.get("source", "Unknown")
-                            page = doc.metadata.get("page", "?")
-                            label = f"s.{page}" if lang == "sv" else f"p.{page}"
-                            st.markdown(f'<div class="source-box"><b>{src}</b> ({label})<br>{doc.page_content[:200]}...</div>', unsafe_allow_html=True)
+        if st.session_state.get("available_sources"):
+            st.multiselect("K?llfilter" if lang == "sv" else "Source filter", options=st.session_state.get("available_sources", []), key="chat_source_filter")
+        for idx, msg in enumerate(st.session_state.chat_history):
+            if msg["role"] == "user":
+                st.markdown(f'<div class="chat-message user-message">{msg["content"]}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="chat-message assistant-message">{msg["content"]}</div>', unsafe_allow_html=True)
+                tools_left, tools_right = st.columns(2)
+                with tools_left:
+                    copy_block(msg["content"], key=f"copy-{idx}")
+                with tools_right:
+                    st.download_button("Ladda ner svar" if lang == "sv" else "Download answer", data=msg["content"].encode("utf-8"), file_name=f"insikt-answer-{idx + 1}.txt", mime="text/plain", key=f"download-answer-{idx}")
+        if prompt := st.chat_input(get_text("chat_input"), disabled=st.session_state.processing):
+            st.session_state.chat_history.append({"role": "user", "content": prompt})
+            with st.spinner("Tänker..." if lang == "sv" else "Thinking..."):
+                llm = load_llm(st.session_state.device_choice)
+                history_lc = [HumanMessage(content=m["content"]) if m["role"] == "user" else AIMessage(content=m["content"]) for m in st.session_state.chat_history[:-1]]
+                answer, sources, issues = rag_chat_with_docs(prompt, history_lc, st.session_state.vectorstore, llm, st.session_state.lang, source_filter=st.session_state.get("chat_source_filter") or None)
+            st.session_state.chat_history.append({"role": "assistant", "content": answer})
+            st.write(answer)
+            if issues:
+                st.warning("Vissa delar av svaret beh?ver dubbelkontroll." if lang == "sv" else "Parts of the answer may need verification.")
+            if sources:
+                with st.expander(get_text("sources")):
+                    for source_index, doc in enumerate(sources[:5]):
+                        src = doc.metadata.get("source", "Unknown")
+                        page = doc.metadata.get("page", "?")
+                        label = f"s.{page}" if lang == "sv" else f"p.{page}"
+                        st.markdown(f'<div class="source-box"><b>{src}</b> ({label})<br>{doc.page_content[:200]}...</div>', unsafe_allow_html=True)
+                        if st.button("Visa källa" if lang == "sv" else "Open source", key=f"open-source-chat-{source_index}"):
+                            st.session_state.selected_preview_source = src
+                            st.session_state.selected_preview_page = str(page)
+                            st.rerun()
 
     with tab_summary:
         st.markdown(f"### {get_text('summarize_title')}")
         st.caption(get_text("summary_help"))
-
         if not st.session_state.docs:
             st.info(get_text("error_no_docs"))
         else:
             col_settings, col_preview = st.columns([2, 1])
             with col_settings:
-                focus = st.text_area(
-                    get_text("focus"),
-                    placeholder="t.ex. korruption, specifik person..." if lang == "sv" else "e.g., corruption, specific person...",
-                    height=90,
-                    disabled=st.session_state.processing,
-                    key="summary_focus"
-                )
-                style = st.selectbox(
-                    get_text("style"),
-                    ["neutral", "investigative", "dramatic", "formal"],
-                    disabled=st.session_state.processing,
-                    key="summary_style"
-                )
-                use_refine = st.checkbox(
-                    get_text("refine_btn"),
-                    value=st.session_state.get("summary_use_refine", True),
-                    disabled=st.session_state.processing,
-                    key="summary_use_refine"
-                )
+                focus = st.text_area(get_text("focus"), placeholder="t.ex. korruption, specifik person..." if lang == "sv" else "e.g., corruption, specific person...", height=90, disabled=st.session_state.processing, key="summary_focus")
+                style = st.selectbox(get_text("style"), ["neutral", "investigative", "dramatic", "formal"], disabled=st.session_state.processing, key="summary_style")
+                use_refine = st.checkbox(get_text("refine_btn"), value=st.session_state.get("summary_use_refine", True), disabled=st.session_state.processing, key="summary_use_refine")
             with col_preview:
-                target_pages = st.slider(
-                    get_text("target_pages"),
-                    1,
-                    50,
-                    st.session_state.get("summary_target_pages", 5),
-                    disabled=st.session_state.processing,
-                    key="summary_target_pages"
-                )
-                words_per_page = st.number_input(
-                    get_text("density"),
-                    100,
-                    500,
-                    st.session_state.get("summary_words_per_page", 300),
-                    disabled=st.session_state.processing,
-                    key="summary_words_per_page"
-                )
+                target_pages = st.slider(get_text("target_pages"), 1, 50, st.session_state.get("summary_target_pages", 5), disabled=st.session_state.processing, key="summary_target_pages")
+                words_per_page = st.number_input(get_text("density"), 100, 500, st.session_state.get("summary_words_per_page", 300), disabled=st.session_state.processing, key="summary_words_per_page")
                 target_words = int(target_pages * words_per_page)
                 st.caption(f"{get_text('summary_estimate')}: {target_words} {'ord' if lang=='sv' else 'words'}")
                 if target_words > 4000:
-                    st.warning("Langt sammanfattningsmal. For hastighet kapas langden vid 4000 ord." if lang == "sv" else "Long target length. For speed, output is capped at 4000 words.")
-
-            if st.button(
-                get_text("summarize_btn"),
-                disabled=st.session_state.processing or st.session_state.summary_running,
-                use_container_width=True
-            ):
+                    st.warning("L?ngt sammanfattningsm?l. F?r hastighet kapas l?ngden vid 4000 ord." if lang == "sv" else "Long target length. For speed, output is capped at 4000 words.")
+            if st.button(get_text("summarize_btn"), disabled=st.session_state.processing or st.session_state.summary_running, use_container_width=True):
                 st.session_state.summary_stage = "initializing"
                 st.session_state.summary_stages_log = []
                 st.session_state.summary_percentage = 0
                 st.session_state.summary_current_batch = 0
                 st.session_state.summary_total_batches = 0
                 st.session_state.summary_cancel_requested = False
-                start_summary(
-                    st.session_state.docs,
-                    target_pages,
-                    focus,
-                    style,
-                    words_per_page,
-                    st.session_state.lang,
-                    use_refine
-                )
+                start_summary(st.session_state.docs, target_pages, focus, style, words_per_page, st.session_state.lang, use_refine)
                 st.rerun()
-
         if st.session_state.summary_running:
             stage = st.session_state.get("summary_stage", "processing")
             percentage = st.session_state.get("summary_percentage", 0)
             current_batch = st.session_state.get("summary_current_batch", 0)
             total_batches = st.session_state.get("summary_total_batches", 0)
-
-            stage_icons = {
-                "idle": "-",
-                "initializing": "~",
-                "processing": "...",
-                "combining": "=",
-                "polishing": "*",
-                "complete": "ok",
-                "error": "x",
-                "cancelled": "stop"
-            }
-            current_icon = stage_icons.get(stage, "...")
-
-            stage_labels = {
-                "idle": "Vantar" if lang == "sv" else "Idle",
-                "initializing": "Initierar" if lang == "sv" else "Initializing",
-                "processing": "Sammanfattar avsnitt" if lang == "sv" else "Processing sections",
-                "combining": "Kombinerar" if lang == "sv" else "Combining",
-                "polishing": "Fardigstaller" if lang == "sv" else "Finalizing",
-                "complete": "Klart" if lang == "sv" else "Complete",
-                "error": "Fel" if lang == "sv" else "Error",
-                "cancelled": "Avbrutet" if lang == "sv" else "Cancelled"
-            }
-
-            st.markdown(
-                f"""
-                <div class="info-box">
-                    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
-                        <span style="font-size: 20px;">{current_icon}</span>
-                        <span style="font-weight: 600; font-size: 15px;">{stage_labels.get(stage, stage)}</span>
-                        <span style="margin-left: auto; font-weight: bold; color: #d97706;">{percentage:.0f}%</span>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
+            stage_labels = {"idle": "Väntar" if lang == "sv" else "Idle", "initializing": "Initierar" if lang == "sv" else "Initializing", "processing": "Sammanfattar avsnitt" if lang == "sv" else "Processing sections", "combining": "Kombinerar" if lang == "sv" else "Combining", "polishing": "Färdigställer" if lang == "sv" else "Finalizing", "complete": "Klart" if lang == "sv" else "Complete", "error": "Fel" if lang == "sv" else "Error", "cancelled": "Avbrutet" if lang == "sv" else "Cancelled"}
+            st.markdown(f'<div class="info-box"><strong>{stage_labels.get(stage, stage)}</strong><span style="float:right;">{percentage:.0f}%</span></div>', unsafe_allow_html=True)
             st.progress(percentage / 100.0)
-
             if stage == "processing" and total_batches > 0:
                 st.caption(f"Batch {current_batch} / {total_batches}")
-
             with st.expander("Logg" if lang == "sv" else "Log"):
-                log = st.session_state.get("summary_stages_log", [])
-                for entry in log[-10:]:
+                for entry in st.session_state.get("summary_stages_log", [])[-10:]:
                     st.caption(f"{entry.get('percentage', 0):.0f}% - {entry.get('message', '')}")
-
-            col1, col2 = st.columns([1, 4])
-            with col1:
-                if st.button("Avbryt" if lang == "sv" else "Cancel", key="cancel_summary"):
-                    st.session_state.summary_cancel_requested = True
-                    if st.session_state.get("summary_thread"):
-                        st.session_state.summary_thread.stop()
-                    st.session_state.summary_running = False
-                    st.session_state.summary_stage = "cancelled"
-                    st.rerun()
-
+            if st.button("Avbryt" if lang == "sv" else "Cancel", key="cancel_summary"):
+                if st.session_state.get("summary_thread"):
+                    st.session_state.summary_thread.stop()
+                st.session_state.summary_running = False
+                st.session_state.summary_stage = "cancelled"
+                st.rerun()
         elif st.session_state.summary_error:
             error_msg = st.session_state.summary_error
             if error_msg == "cancelled":
-                st.markdown(f'<div class="warning-box">{"Atgardan avbrots av anvandaren." if lang=="sv" else "Operation cancelled by user."}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="warning-box">{"Åtgärden avbröts av användaren." if lang=="sv" else "Operation cancelled by user."}</div>', unsafe_allow_html=True)
             else:
                 st.markdown(f'<div class="warning-box">{"Fel: " if lang=="sv" else "Error: "}{error_msg}</div>', unsafe_allow_html=True)
         elif st.session_state.summary_result:
@@ -2113,65 +2050,28 @@ def main():
             st.write(st.session_state.summary_result)
             st.session_state.last_summary = st.session_state.summary_result
             st.success(get_text("success_summary"))
+            st.download_button("Ladda ner sammanfattning" if lang == "sv" else "Download summary", data=st.session_state.summary_result.encode("utf-8"), file_name="insikt-summary.txt", mime="text/plain")
 
     with tab_write:
         st.markdown(f"### {get_text('writing_title')}")
         st.caption(get_text("writing_help"))
-
-        brief = st.text_area(
-            get_text("writing_brief"),
-            placeholder=get_text("writing_placeholder"),
-            height=140,
-            key="writing_brief"
-        )
+        brief = st.text_area(get_text("writing_brief"), placeholder=get_text("writing_placeholder"), height=140, key="writing_brief")
         col_a, col_b = st.columns(2)
         with col_a:
-            role_key = st.selectbox(
-                get_text("writing_role"),
-                options=list(WRITING_ROLES.keys()),
-                format_func=lambda x: WRITING_ROLES[x]["sv"] if lang == "sv" else WRITING_ROLES[x]["en"],
-                key="writing_role"
-            )
-            format_key = st.selectbox(
-                get_text("writing_format"),
-                options=list(WRITING_FORMATS.keys()),
-                format_func=lambda x: WRITING_FORMATS[x]["sv"] if lang == "sv" else WRITING_FORMATS[x]["en"],
-                key="writing_format"
-            )
+            role_key = st.selectbox(get_text("writing_role"), options=list(WRITING_ROLES.keys()), format_func=lambda x: WRITING_ROLES[x]["sv"] if lang == "sv" else WRITING_ROLES[x]["en"], key="writing_role")
+            format_key = st.selectbox(get_text("writing_format"), options=list(WRITING_FORMATS.keys()), format_func=lambda x: WRITING_FORMATS[x]["sv"] if lang == "sv" else WRITING_FORMATS[x]["en"], key="writing_format")
         with col_b:
-            tone_key = st.selectbox(
-                get_text("writing_tone"),
-                options=list(WRITING_TONES.keys()),
-                format_func=lambda x: WRITING_TONES[x]["sv"] if lang == "sv" else WRITING_TONES[x]["en"],
-                key="writing_tone"
-            )
-            length_key = st.selectbox(
-                get_text("writing_length"),
-                options=list(WRITING_LENGTHS.keys()),
-                format_func=lambda x: WRITING_LENGTHS[x]["sv"] if lang == "sv" else WRITING_LENGTHS[x]["en"],
-                key="writing_length"
-            )
-
+            tone_key = st.selectbox(get_text("writing_tone"), options=list(WRITING_TONES.keys()), format_func=lambda x: WRITING_TONES[x]["sv"] if lang == "sv" else WRITING_TONES[x]["en"], key="writing_tone")
+            length_key = st.selectbox(get_text("writing_length"), options=list(WRITING_LENGTHS.keys()), format_func=lambda x: WRITING_LENGTHS[x]["sv"] if lang == "sv" else WRITING_LENGTHS[x]["en"], key="writing_length")
         use_sources = st.checkbox(get_text("writing_use_sources"), value=st.session_state.get("writing_use_sources", True), key="writing_use_sources")
         use_pipeline = st.checkbox(get_text("writing_pipeline"), value=st.session_state.get("writing_pipeline", False), key="writing_pipeline", help=get_text("writing_pipeline_help"))
-
+        if st.session_state.get("available_sources"):
+            st.multiselect("K?llfilter" if lang == "sv" else "Source filter", options=st.session_state.get("available_sources", []), key="writing_source_filter")
         if st.button(get_text("writing_generate"), disabled=st.session_state.processing or not brief):
             llm = load_llm(st.session_state.device_choice)
-            result, used_sources = generate_writing(
-                brief,
-                role_key,
-                format_key,
-                tone_key,
-                length_key,
-                lang,
-                st.session_state.vectorstore,
-                llm,
-                use_sources=use_sources,
-                use_pipeline=use_pipeline
-            )
+            result, used_sources = rag_generate_writing(brief, WRITING_ROLES[role_key]["sv" if lang == "sv" else "en"], WRITING_FORMATS[format_key]["sv" if lang == "sv" else "en"], WRITING_TONES[tone_key]["sv" if lang == "sv" else "en"], WRITING_LENGTHS[length_key]["words"], lang, st.session_state.vectorstore, llm, use_sources=use_sources, use_pipeline=use_pipeline, source_filter=st.session_state.get("writing_source_filter") or None)
             st.session_state.writing_result = result
             st.session_state.writing_sources = used_sources
-
         if st.session_state.get("writing_result"):
             st.markdown("### " + get_text("writing_result"))
             st.write(st.session_state.writing_result)
@@ -2183,11 +2083,15 @@ def main():
                         page = doc.metadata.get("page", "?")
                         label = f"s.{page}" if lang == "sv" else f"p.{page}"
                         st.markdown(f'<div class="source-box"><b>{src}</b> ({label})<br>{doc.page_content[:200]}...</div>', unsafe_allow_html=True)
+                        if st.button("Visa källa" if lang == "sv" else "Open source", key=f"open-source-write-{src}-{page}"):
+                            st.session_state.selected_preview_source = src
+                            st.session_state.selected_preview_page = str(page)
+                            st.rerun()
 
     with tab_analysis:
         st.markdown(f"### {get_text('analysis_title')}")
         if not st.session_state.docs:
-            st.warning("Ladda upp dokument forst." if lang == "sv" else "Please upload documents first.")
+            st.warning("Ladda upp dokument f?rst." if lang == "sv" else "Please upload documents first.")
         else:
             ner_pipeline = load_ner_pipeline(st.session_state.device_choice)
             sent_pipeline = load_sentiment_pipeline(st.session_state.device_choice)
@@ -2195,72 +2099,58 @@ def main():
             with col1:
                 if st.button(get_text("ner_extract"), disabled=st.session_state.processing):
                     with st.spinner("Extraherar..." if lang == "sv" else "Extracting..."):
-                        all_text = " ".join([d.page_content for d in st.session_state.docs[:50]])
-                        entities = extract_entities(all_text, ner_pipeline)
-                        for k, v in entities.items():
-                            st.markdown(f"**{k}**")
-                            st.write(", ".join(list(v)[:20]) + ("..." if len(v) > 20 else ""))
+                        entities = extract_entities(" ".join([d.page_content for d in st.session_state.docs[:50]]), ner_pipeline)
+                        for key, values in entities.items():
+                            st.markdown(f"**{key}**")
+                            st.write(", ".join(list(values)[:20]) + ("..." if len(values) > 20 else ""))
             with col2:
                 if st.button(get_text("timeline"), disabled=st.session_state.processing):
                     with st.spinner("Skapar tidslinje..." if lang == "sv" else "Building timeline..."):
                         timeline = extract_timeline(st.session_state.docs[:200])
                         if timeline:
                             for item in timeline[:30]:
-                                st.markdown(
-                                    f"**{item['date']}** - {item['context'][:150]}...\\n*{item['source']} s.{item['page']}*"
-                                    if lang == "sv"
-                                    else f"**{item['date']}** - {item['context'][:150]}...\\n*{item['source']} p.{item['page']}*"
-                                )
+                                st.markdown(f"**{item['date']}** - {item['context'][:150]}...\n*{item['source']} {'s.' if lang == 'sv' else 'p.'}{item['page']}*")
                         else:
                             st.info("Inga datum hittades." if lang == "sv" else "No dates found.")
             with col3:
                 if st.button(get_text("keywords"), disabled=st.session_state.processing):
                     with st.spinner("Extraherar nyckelord..." if lang == "sv" else "Extracting keywords..."):
                         text = st.session_state.last_summary if st.session_state.last_summary else st.session_state.docs[0].page_content
-                        keywords = extract_keywords(text)
-                        st.write("Toppnyckelord:" if lang == "sv" else "Top keywords:", ", ".join(keywords))
-
-            if st.session_state.last_summary:
-                if st.button(get_text("sentiment"), disabled=st.session_state.processing):
-                    with st.spinner("Analyserar sentiment..." if lang == "sv" else "Analyzing sentiment..."):
-                        result = analyze_sentiment(st.session_state.last_summary, sent_pipeline)
-                        st.write(f"Sentiment: **{result['label']}** (konfidens: {result['score']:.2f})" if lang == "sv" else f"Sentiment: **{result['label']}** (confidence: {result['score']:.2f})")
+                        st.write("Toppnyckelord:" if lang == "sv" else "Top keywords:", ", ".join(extract_keywords(text, language="sv" if lang == "sv" else "en")))
+            if st.session_state.last_summary and st.button(get_text("sentiment"), disabled=st.session_state.processing):
+                with st.spinner("Analyserar sentiment..." if lang == "sv" else "Analyzing sentiment..."):
+                    result = analyze_sentiment(st.session_state.last_summary, sent_pipeline)
+                    st.write(f"Sentiment: **{result['label']}** (konfidens: {result['score']:.2f})" if lang == "sv" else f"Sentiment: **{result['label']}** (confidence: {result['score']:.2f})")
 
     with tab_export:
         st.markdown(f"### {get_text('export_title')}")
         if not st.session_state.last_summary:
-            st.info("Generera en sammanfattning forst." if lang == "sv" else "Generate a summary first.")
+            st.info("Generera en sammanfattning f?rst." if lang == "sv" else "Generate a summary first.")
         else:
             text = st.session_state.last_summary
             col1, col2, col3, col4 = st.columns(4)
-            if col1.button("TXT", disabled=st.session_state.processing):
-                st.download_button("Ladda ner" if lang == "sv" else "Download", export_text(text), "sammanfattning.txt" if lang == "sv" else "summary.txt")
-            if col2.button("DOCX", disabled=st.session_state.processing):
-                st.download_button("Ladda ner" if lang == "sv" else "Download", export_docx(text), "sammanfattning.docx" if lang == "sv" else "summary.docx")
-            if col3.button("PDF", disabled=st.session_state.processing):
-                st.download_button("Ladda ner" if lang == "sv" else "Download", export_pdf(text), "sammanfattning.pdf" if lang == "sv" else "summary.pdf")
-            if col4.button("MD", disabled=st.session_state.processing):
-                st.download_button("Ladda ner" if lang == "sv" else "Download", export_markdown(text), "sammanfattning.md" if lang == "sv" else "summary.md")
-
+            with col1:
+                st.download_button("TXT", export_text(text), "sammanfattning.txt" if lang == "sv" else "summary.txt", mime="text/plain")
+            with col2:
+                st.download_button("DOCX", export_docx(text), "sammanfattning.docx" if lang == "sv" else "summary.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            with col3:
+                st.download_button("PDF", export_pdf(text), "sammanfattning.pdf" if lang == "sv" else "summary.pdf", mime="application/pdf")
+            with col4:
+                st.download_button("MD", export_markdown(text), "sammanfattning.md" if lang == "sv" else "summary.md", mime="text/markdown")
             if st.button(get_text("bias_check"), disabled=st.session_state.processing):
                 with st.spinner("Kontrollerar partiskhet..." if lang == "sv" else "Checking for bias..."):
                     llm = load_llm(st.session_state.device_choice)
-                    critique = bias_check(text, llm, st.session_state.lang)
-                    st.markdown("### Partiskhetsgranskning" if lang == "sv" else "### Bias Critique")
-                    st.write(critique)
-
+                    st.write(bias_check(text, llm, st.session_state.lang))
             target_lang = st.selectbox(get_text("translate"), ["Svenska", "English", "Spanish", "French", "German"] if lang == "sv" else ["Swedish", "English", "Spanish", "French", "German"])
-            if st.button("Oversatt" if lang == "sv" else "Translate", disabled=st.session_state.processing):
-                with st.spinner("Oversatter..." if lang == "sv" else "Translating..."):
+            if st.button("Översätt" if lang == "sv" else "Translate", disabled=st.session_state.processing):
+                with st.spinner("Översätter..." if lang == "sv" else "Translating..."):
                     llm = load_llm(st.session_state.device_choice)
                     translated = translate_text(text, target_lang, llm, st.session_state.lang)
-                    st.markdown(f"### Oversattning ({target_lang})" if lang == "sv" else f"### Translation ({target_lang})")
+                    st.markdown(f"### Översättning ({target_lang})" if lang == "sv" else f"### Translation ({target_lang})")
                     st.write(translated)
 
-    # Footer
     st.divider()
     st.caption("Insikt - 100% lokalt, privat och gratis." if lang == "sv" else "Insikt - 100% local, private, and free.")
-
     if st.session_state.summary_running:
         time.sleep(0.3)
         st.rerun()

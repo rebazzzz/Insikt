@@ -189,3 +189,5 @@ logs/
 # Ollama model files (if you ever store them locally – but normally they are elsewhere)
 models/
 ollama_models/
+
+

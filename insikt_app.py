@@ -6,6 +6,7 @@ Now with user-selectable GPU/CPU processing.
 """
 
 import os
+import json
 import subprocess
 import sys
 import tempfile
@@ -808,14 +809,17 @@ def generate_doc_hash(docs):
         hasher.update(text.encode("utf-8", errors="ignore"))
     return hasher.hexdigest()
 
-def get_cached_summary(doc_hash, focus, style, target_words, use_refine):
+SUMMARY_CACHE_VERSION = "v3"
+
+
+def get_cached_summary(doc_hash, focus, style, target_words, use_refine, model_key, lang):
     """Retrieve cached summary if available."""
-    cache_key = f"{doc_hash}_{focus}_{style}_{target_words}_{use_refine}"
+    cache_key = f"{SUMMARY_CACHE_VERSION}_{doc_hash}_{focus}_{style}_{target_words}_{use_refine}_{model_key}_{lang}"
     return st.session_state.get("summary_cache", {}).get(cache_key)
 
-def set_cached_summary(doc_hash, focus, style, target_words, use_refine, summary):
+def set_cached_summary(doc_hash, focus, style, target_words, use_refine, model_key, lang, summary):
     """Store summary in cache."""
-    cache_key = f"{doc_hash}_{focus}_{style}_{target_words}_{use_refine}"
+    cache_key = f"{SUMMARY_CACHE_VERSION}_{doc_hash}_{focus}_{style}_{target_words}_{use_refine}_{model_key}_{lang}"
     if "summary_cache" not in st.session_state:
         st.session_state.summary_cache = {}
     st.session_state.summary_cache[cache_key] = summary
@@ -835,6 +839,15 @@ class SummaryThread(threading.Thread):
         self.result = None
         self.error = None
         self._stop_event = threading.Event()
+        self.progress_info = {
+            "stage": "idle",
+            "current": 0,
+            "total": 0,
+            "percentage": 0,
+            "message": "",
+            "log": [],
+            "updated_at": time.time(),
+        }
 
     def stop(self):
         self._stop_event.set()
@@ -844,6 +857,28 @@ class SummaryThread(threading.Thread):
             self.error = "cancelled"
             return True
         return False
+
+    def _update_progress(self, stage, current, total, percentage, message):
+        log = list(self.progress_info.get("log", []))
+        if message and (not log or log[-1]["message"] != message):
+            log.append(
+                {
+                    "stage": stage,
+                    "message": message,
+                    "timestamp": time.time(),
+                    "percentage": percentage,
+                }
+            )
+            log = log[-50:]
+        self.progress_info = {
+            "stage": stage,
+            "current": current,
+            "total": total,
+            "percentage": percentage,
+            "message": message,
+            "log": log,
+            "updated_at": time.time(),
+        }
 
     def _build_batches(self, max_chars=None, max_chunks=None):
         doc_count = len(self.docs)
@@ -863,81 +898,439 @@ class SummaryThread(threading.Thread):
         for doc in self.docs:
             source = doc.metadata.get("source", "Unknown")
             page = doc.metadata.get("page", "?")
-            if self.lang == "sv":
-                entry = f"[Från {source}, sida {page}]: {doc.page_content}\n\n"
-            else:
-                entry = f"[From {source}, page {page}]: {doc.page_content}\n\n"
+            entry = self._format_doc_entry(doc)
             if current and (current_chars + len(entry) > max_chars or len(current) >= max_chunks):
-                batches.append("".join(current))
+                batches.append({"docs": current[:]})
                 current = []
                 current_chars = 0
-            current.append(entry)
+            current.append(doc)
             current_chars += len(entry)
         if current:
-            batches.append("".join(current))
+            batches.append({"docs": current[:]})
         return batches
+
+    def _format_doc_entry(self, doc):
+        source = doc.metadata.get("source", "Unknown")
+        page = doc.metadata.get("page", "?")
+        if self.lang == "sv":
+            return f"[Från {source}, sida {page}]: {doc.page_content}\n\n"
+        return f"[From {source}, page {page}]: {doc.page_content}\n\n"
+
+    def _batch_text(self, batch):
+        return "".join(self._format_doc_entry(doc) for doc in batch.get("docs", []))
+
+    def _allowed_citations(self, docs):
+        allowed = []
+        seen = set()
+        for doc in docs:
+            source = str(doc.metadata.get("source", "Unknown")).strip()
+            page = str(doc.metadata.get("page", "?")).strip()
+            key = (source, page)
+            if key in seen:
+                continue
+            seen.add(key)
+            allowed.append({"source": source, "page": page})
+        return allowed
+
+    def _extract_json_block(self, raw_text):
+        if not raw_text:
+            return None
+        start_positions = [pos for pos in [raw_text.find("["), raw_text.find("{")] if pos != -1]
+        if not start_positions:
+            return None
+        start = min(start_positions)
+        end_bracket = raw_text.rfind("]")
+        end_brace = raw_text.rfind("}")
+        end = max(end_bracket, end_brace)
+        if end <= start:
+            return None
+        return raw_text[start:end + 1]
+
+    def _extract_fact_records(self, llm, batch):
+        docs = batch.get("docs", [])
+        allowed_citations = self._allowed_citations(docs)
+        if not docs or not allowed_citations:
+            return []
+        allowed_text = "\n".join(
+            f"- {item['source']} | {item['page']}" for item in allowed_citations
+        )
+        batch_text = self._batch_text(batch)
+        if self.lang == "sv":
+            prompt = """Du är en undersökande journalist. Extrahera verifierbara sakuppgifter ur materialet nedan.
+Returnera endast JSON och inget annat.
+
+Format:
+{
+  "facts": [
+    {
+      "claim": "kort verifierbar sakuppgift",
+      "citations": [
+        {"source": "exakt filnamn", "page": "exakt sida"}
+      ]
+    }
+  ]
+}
+
+Regler:
+- Använd endast citatnycklar från listan över tillåtna källor.
+- Varje sakuppgift måste ha 1 till 2 källhänvisningar.
+- Sakuppgiften måste vara kort, konkret och verifierbar.
+- Om något inte kan styrkas direkt ska det inte tas med.
+- Returnera mellan 6 och 12 sakuppgifter.
+
+Tillåtna källor:
+{allowed_text}
+
+Material:
+{batch_text}
+"""
+        else:
+            prompt = """You are an investigative journalist. Extract verifiable factual records from the material below.
+Return JSON only and nothing else.
+
+Format:
+{
+  "facts": [
+    {
+      "claim": "short verifiable factual point",
+      "citations": [
+        {"source": "exact filename", "page": "exact page"}
+      ]
+    }
+  ]
+}
+
+Rules:
+- Use only citation keys from the allowed source list.
+- Every fact must have 1 to 2 citations.
+- Each fact must be short, concrete, and verifiable.
+- If something is not directly supported, leave it out.
+- Return 6 to 12 facts.
+
+Allowed citations:
+{allowed_text}
+
+Material:
+{batch_text}
+"""
+        try:
+            raw = llm.invoke(prompt.format(allowed_text=allowed_text, batch_text=batch_text)).content
+            json_block = self._extract_json_block(raw)
+            if not json_block:
+                return []
+            payload = json.loads(json_block)
+        except Exception:
+            return []
+        raw_facts = payload.get("facts", []) if isinstance(payload, dict) else []
+        allowed_set = {(item["source"], item["page"]) for item in allowed_citations}
+        records = []
+        for fact in raw_facts:
+            if not isinstance(fact, dict):
+                continue
+            claim = " ".join(str(fact.get("claim", "")).split())
+            if len(claim) < 20:
+                continue
+            citations = []
+            for citation in fact.get("citations", []):
+                if not isinstance(citation, dict):
+                    continue
+                source = str(citation.get("source", "")).strip()
+                page = str(citation.get("page", "")).strip()
+                if (source, page) in allowed_set and {"source": source, "page": page} not in citations:
+                    citations.append({"source": source, "page": page})
+            if not citations:
+                continue
+            records.append({"claim": claim, "citations": citations})
+        return records
+
+    def _format_fact_record(self, fact):
+        citation_bits = []
+        for citation in fact.get("citations", []):
+            if self.lang == "sv":
+                citation_bits.append(f"[Källa: {citation['source']}, sida {citation['page']}]")
+            else:
+                citation_bits.append(f"[Source: {citation['source']}, page {citation['page']}]")
+        return f"- {fact.get('claim', '').strip()} {' '.join(citation_bits)}".strip()
+
+    def _attach_fact_ids(self, facts):
+        return [
+            {
+                "id": f"F{index}",
+                "claim": fact.get("claim", ""),
+                "citations": list(fact.get("citations", [])),
+            }
+            for index, fact in enumerate(facts, start=1)
+        ]
+
+    def _normalize_fact_text(self, text):
+        return " ".join(re.findall(r"[A-Za-z0-9ÅÄÖåäö]{3,}", (text or "").lower()))
+
+    def _score_fact(self, fact):
+        claim = fact.get("claim", "")
+        citations = fact.get("citations", [])
+        score = 0.0
+        score += min(len(citations), 2) * 2.0
+        if re.search(r"\b\d{4}\b", claim):
+            score += 1.5
+        if re.search(r"\b\d+(?:[\.,]\d+)?\b", claim):
+            score += 1.0
+        if re.search(r"\b[A-ZÅÄÖ][a-zåäö]+(?:\s+[A-ZÅÄÖ][a-zåäö]+)+", claim):
+            score += 1.0
+        focus_terms = [term for term in re.findall(r"[A-Za-z0-9ÅÄÖåäö]{4,}", (self.focus or "").lower()) if len(term) >= 4]
+        claim_lower = claim.lower()
+        score += sum(1.2 for term in focus_terms if term in claim_lower)
+        score += min(len(claim.split()) / 12.0, 2.0)
+        return score
+
+    def _dedupe_and_rank_facts(self, facts):
+        ranked = []
+        seen = set()
+        for fact in facts:
+            norm = self._normalize_fact_text(fact.get("claim", ""))
+            if not norm:
+                continue
+            token_key = " ".join(norm.split()[:18])
+            if token_key in seen:
+                continue
+            seen.add(token_key)
+            enriched = dict(fact)
+            enriched["score"] = self._score_fact(enriched)
+            ranked.append(enriched)
+        ranked.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+        return ranked
+
+    def _distribute_facts_across_sections(self, facts, section_count):
+        if not facts:
+            return []
+        section_count = max(1, min(section_count, len(facts)))
+        buckets = [[] for _ in range(section_count)]
+        recent_sources = [set() for _ in range(section_count)]
+        for fact in facts:
+            fact_sources = {citation.get("source", "") for citation in fact.get("citations", [])}
+            best_index = 0
+            best_key = None
+            for index in range(section_count):
+                overlap = len(fact_sources & recent_sources[index])
+                bucket_size = len(buckets[index])
+                score_key = (overlap, bucket_size)
+                if best_key is None or score_key < best_key:
+                    best_key = score_key
+                    best_index = index
+            buckets[best_index].append(fact)
+            recent_sources[best_index].update(fact_sources)
+        return [bucket for bucket in buckets if bucket]
+
+    def _render_citations_for_fact_ids(self, fact_ids, fact_lookup):
+        citations = []
+        seen = set()
+        for fact_id in fact_ids:
+            fact = fact_lookup.get(fact_id)
+            if not fact:
+                continue
+            for citation in fact.get("citations", []):
+                key = (citation.get("source", ""), citation.get("page", ""))
+                if key in seen:
+                    continue
+                seen.add(key)
+                if self.lang == "sv":
+                    citations.append(f"[Källa: {key[0]}, sida {key[1]}]")
+                else:
+                    citations.append(f"[Source: {key[0]}, page {key[1]}]")
+        return " ".join(citations)
+
+    def _build_section_from_facts(self, llm, facts, section_number, section_count, min_section_words, max_section_words):
+        fact_lookup = {fact["id"]: fact for fact in facts}
+        fact_lines = "\n".join(f"[{fact['id']}] {fact['claim']}" for fact in facts)
+        allowed_ids = ", ".join(fact_lookup.keys())
+        if self.lang == "sv":
+            prompt = """Du är en undersökande journalist. Skriv del {section_number} av {section_count} av en längre sammanfattning.
+Returnera endast JSON och inget annat.
+
+Format:
+{{
+  "heading": "kort rubrik",
+  "paragraphs": [
+    {{
+      "text": "kort stycke utan källhänvisningar",
+      "fact_ids": ["F1", "F2"]
+    }}
+  ]
+}}
+
+Regler:
+- Mållängd för denna del: mellan {min_section_words} och {max_section_words} ord.
+- Fokusera på: {focus}. Stil: {style}.
+- Använd endast fakta från listan nedan.
+- Varje stycke måste använda 2 till 4 fact_ids från listan.
+- Skriv inga källhänvisningar i texten själv.
+- Lägg inte till information som inte stöds av fact_ids.
+- Ge 2 till 5 stycken beroende på materialmängden.
+
+Tillåtna fact_ids:
+{allowed_ids}
+
+Faktaunderlag:
+{fact_lines}
+"""
+        else:
+            prompt = """You are an investigative journalist. Write section {section_number} of {section_count} of a longer summary.
+Return JSON only and nothing else.
+
+Format:
+{{
+  "heading": "short heading",
+  "paragraphs": [
+    {{
+      "text": "short paragraph without citations",
+      "fact_ids": ["F1", "F2"]
+    }}
+  ]
+}}
+
+Rules:
+- Target length for this section: between {min_section_words} and {max_section_words} words.
+- Focus on: {focus}. Style: {style}.
+- Use only the facts listed below.
+- Every paragraph must use 2 to 4 fact_ids from the allowed list.
+- Do not write citations in the paragraph text itself.
+- Do not add information unsupported by the fact_ids.
+- Write 2 to 5 paragraphs depending on the amount of material.
+
+Allowed fact_ids:
+{allowed_ids}
+
+Fact base:
+{fact_lines}
+"""
+        try:
+            raw = llm.invoke(
+                prompt.format(
+                    section_number=section_number,
+                    section_count=section_count,
+                    min_section_words=min_section_words,
+                    max_section_words=max_section_words,
+                    focus=self.focus,
+                    style=self.style,
+                    allowed_ids=allowed_ids,
+                    fact_lines=fact_lines,
+                )
+            ).content
+            json_block = self._extract_json_block(raw)
+            if not json_block:
+                return ""
+            payload = json.loads(json_block)
+        except Exception:
+            return ""
+        heading = " ".join(str(payload.get("heading", "")).split()) if isinstance(payload, dict) else ""
+        paragraphs = payload.get("paragraphs", []) if isinstance(payload, dict) else []
+        rendered = []
+        if heading:
+            rendered.append(heading)
+        for paragraph in paragraphs:
+            if not isinstance(paragraph, dict):
+                continue
+            text = " ".join(str(paragraph.get("text", "")).split())
+            if len(text) < 30:
+                continue
+            fact_ids = []
+            for fact_id in paragraph.get("fact_ids", []):
+                fact_id = str(fact_id).strip()
+                if fact_id in fact_lookup and fact_id not in fact_ids:
+                    fact_ids.append(fact_id)
+            if not fact_ids:
+                continue
+            citation_text = self._render_citations_for_fact_ids(fact_ids, fact_lookup)
+            rendered.append(f"{text} {citation_text}".strip())
+        return "\n\n".join(rendered).strip()
 
     def _reduce_summary_group(self, llm, reduce_template, summaries, target_words):
         prompt = reduce_template.format(
             existing_summaries="\n\n".join(summaries),
             target_words=target_words,
+            min_target_words=max(150, int(target_words * 0.85)),
+            max_target_words=max(target_words, int(target_words * 1.1)),
             focus=self.focus,
             style=self.style,
         )
         return llm.invoke(prompt).content
 
+    def _group_items_evenly(self, items, group_count):
+        if not items:
+            return []
+        group_count = max(1, min(group_count, len(items)))
+        groups = []
+        start = 0
+        base = len(items) // group_count
+        remainder = len(items) % group_count
+        for index in range(group_count):
+            size = base + (1 if index < remainder else 0)
+            groups.append(items[start:start + size])
+            start += size
+        return [group for group in groups if group]
+
     def run(self):
         try:
             target_words = max(150, self.target_pages * self.words_per_page)
-            num_predict = max(int(target_words * 1.3), 512)
-            llm = ChatOllama(model=self.llm_model, temperature=0.2, num_predict=num_predict)
+            num_predict = max(int(target_words * 1.8), 768)
+            llm = ChatOllama(model=self.llm_model, temperature=0.0, num_predict=num_predict)
+            min_target_words = max(150, int(target_words * 0.85))
+            max_target_words = max(target_words, int(target_words * 1.1))
 
             # ===== STEP 1: BATCH CHUNKS TOGETHER =====
             batches = self._build_batches()
+            self._update_progress(
+                "initializing",
+                0,
+                len(batches),
+                3,
+                "Förbereder sammanfattningen..." if self.lang == "sv" else "Preparing summary...",
+            )
 
             if self.lang == "sv":
-                map_template = """Du är en undersökande journalist. Skapa en detaljerad sammanfattning av följande textavsnitt med fokus på: {focus}.
-Stil: {style}. Inkludera viktiga fakta, namn, datum och sidhänvisningar.
-Textavsnitt: {text}
-
-Detaljerad sammanfattning av detta avsnitt:"""
-
-                reduce_template = """Du är en journalist och redaktör. Kombinera följande separata sammanfattningar till en sammanhängande helhet på ungefär {target_words} ord.
+                reduce_template = """Du är en journalist och redaktör. Kombinera följande separata sammanfattningar till en sammanhängande helhet på mellan {min_target_words} och {max_target_words} ord.
 Fokus: {focus}. Stil: {style}.
 Bevara viktiga fakta, namn, datum och källhänvisningar.
+Använd endast information från sammanfattningarna nedan. Lägg inte till externa referenser, egna slutsatser eller en separat referenslista.
+Varje stycke måste innehålla minst en tydlig källhänvisning i formatet [Källa: filnamn, sida X].
+Om informationen är osäker eller motsägelsefull ska du skriva det tydligt istället för att gissa.
+Fyll ut längden med fler dokumenterade detaljer från materialet, inte med repetition.
 
 Sammanfattningar att kombinera:
 {existing_summaries}
 
 Kombinerad sammanfattning:"""
 
-                final_prompt = f"""Du är en journalist och redaktör. Förfina följande sammanfattning till en slutlig, polerad version på ungefär {target_words} ord.
-Stil: {{style}}. Fokus: {{focus}}.
+                final_prompt = """Du är en journalist och redaktör. Förfina följande sammanfattning till en slutlig, polerad version på mellan {min_target_words} och {max_target_words} ord.
+Stil: {style}. Fokus: {focus}.
 Inkludera källhänvisningar [Källa: filnamn, sida X] där möjligt.
+Använd endast information som redan finns i texten eller i källhänvisningarna. Lägg inte till externa referenser, avsnitt som heter Referenser/Källor/Noter eller påhittade detaljer.
+Varje stycke måste innehålla minst en tydlig källhänvisning. Ta bort alla meningar som inte går att koppla till en källa.
+Om texten blir för kort, utveckla den med fler konkreta dokumenterade detaljer som redan finns i underlaget istället för att upprepa dig.
 
 Sammanfattning att förfina:
-{{current_summary}}
+{current_summary}
 
 Slutlig sammanfattning:"""
             else:
-                map_template = """You are an investigative journalist. Create a detailed summary of the following text passage, focusing on: {focus}.
-Style: {style}. Include key facts, names, dates, and page references.
-Text passage: {text}
-
-Detailed summary of this passage:"""
-
-                reduce_template = """You are a journalist and editor. Combine the following separate summaries into a coherent whole of approximately {target_words} words.
+                reduce_template = """You are a journalist and editor. Combine the following separate summaries into a coherent whole of between {min_target_words} and {max_target_words} words.
 Focus: {focus}. Style: {style}.
 Preserve important facts, names, dates, and source citations.
+Use only information from the summaries below. Do not add outside references, new claims, or a separate references section.
+Every paragraph must contain at least one clear citation in the format [Source: filename, page X].
+If information is uncertain or conflicting, say so explicitly instead of guessing.
+Reach the target length by adding more documented detail from the material, not by repeating yourself.
 
 Summaries to combine:
 {existing_summaries}
 
 Combined summary:"""
 
-                final_prompt = """You are a journalist and editor. Refine the following summary into a final, polished version of approximately {target_words} words.
+                final_prompt = """You are a journalist and editor. Refine the following summary into a final, polished version of between {min_target_words} and {max_target_words} words.
 Style: {style}. Focus: {focus}.
 Include citations [Source: filename, page X] where possible.
+Use only information already present in the text or its citations. Do not add outside references, sections called References/Sources/Notes, or invented details.
+Every paragraph must contain at least one clear citation. Remove any sentence that cannot be tied to a citation.
+If the text is too short, expand it with more concrete documented details already present in the material instead of repeating points.
 
 Summary to refine:
 {current_summary}
@@ -945,50 +1338,95 @@ Summary to refine:
 Final summary:"""
 
             # ===== STEP 2: MAP PHASE - Process batches =====
-            batch_summaries = []
+            batch_fact_lists = []
             total_batches = len(batches)
 
             for batch_idx, batch in enumerate(batches):
                 if self._check_cancelled():
                     return
                 percentage = int((batch_idx + 1) / total_batches * 70)
-                if self.progress_callback:
-                    self.progress_callback(
-                        "processing",
-                        batch_idx + 1,
-                        total_batches,
-                        percentage,
-                        f"Sammanfattar avsnitt {batch_idx + 1} av {total_batches}..." if self.lang == "sv" else f"Summarizing section {batch_idx + 1} of {total_batches}..."
-                    )
+                self._update_progress(
+                    "processing",
+                    batch_idx + 1,
+                    total_batches,
+                    percentage,
+                    f"Extraherar fakta ur avsnitt {batch_idx + 1} av {total_batches}..." if self.lang == "sv" else f"Extracting facts from section {batch_idx + 1} of {total_batches}..."
+                )
                 try:
-                    prompt = map_template.format(focus=self.focus, text=batch, style=self.style)
-                    summary = llm.invoke(prompt).content
-                    batch_summaries.append(summary)
+                    facts = self._extract_fact_records(llm, batch)
+                    if facts:
+                        batch_fact_lists.append(facts)
                 except Exception as e:
                     self.error = str(e)
                     return
 
+            all_fact_records = [fact for fact_list in batch_fact_lists for fact in fact_list]
+            if not all_fact_records:
+                self.error = "Inga verifierbara sakuppgifter kunde extraheras ur materialet." if self.lang == "sv" else "No verifiable factual records could be extracted from the material."
+                return
+
             # ===== STEP 3: REDUCE PHASE =====
             if self._check_cancelled():
                 return
-            if self.progress_callback:
-                self.progress_callback(
-                    "combining",
-                    total_batches,
-                    total_batches,
-                    85,
-                    "Kombinerar sammanfattningar..." if self.lang == "sv" else "Combining summaries..."
-                )
+            self._update_progress(
+                "combining",
+                total_batches,
+                total_batches,
+                85,
+                "Kombinerar sammanfattningar..." if self.lang == "sv" else "Combining summaries..."
+            )
 
-            if len(batch_summaries) == 1:
-                combined_summary = batch_summaries[0]
+            ranked_fact_records = self._dedupe_and_rank_facts(all_fact_records)
+            formatted_facts = [self._format_fact_record(fact) for fact in ranked_fact_records]
+            fact_records_with_ids = self._attach_fact_ids(ranked_fact_records)
+            if self.target_pages >= 1:
+                section_count = min(max(1, self.target_pages), len(fact_records_with_ids))
+                section_groups = self._distribute_facts_across_sections(fact_records_with_ids, section_count)
+                section_summaries = []
+                min_section_words = max(120, int(self.words_per_page * 0.85))
+                max_section_words = max(self.words_per_page, int(self.words_per_page * 1.15))
+                for section_idx, group in enumerate(section_groups, start=1):
+                    if self._check_cancelled():
+                        return
+                    group = group[:18]
+                    self._update_progress(
+                        "combining",
+                        section_idx,
+                        len(section_groups),
+                        min(80 + int(section_idx / max(len(section_groups), 1) * 15), 95),
+                        (
+                            f"Bygger del {section_idx} av {len(section_groups)}..."
+                            if self.lang == "sv"
+                            else f"Building section {section_idx} of {len(section_groups)}..."
+                        ),
+                    )
+                    try:
+                        section_summary = self._build_section_from_facts(
+                            llm,
+                            group,
+                            section_idx,
+                            len(section_groups),
+                            min_section_words,
+                            max_section_words,
+                        )
+                        if section_summary:
+                            section_summaries.append(_strip_summary_artifacts(section_summary))
+                    except Exception as e:
+                        self.error = str(e)
+                        return
+                combined_summary = "\n\n".join(section_summaries).strip()
+                if not combined_summary:
+                    self.error = "Kunde inte bygga sammanfattningsdelar från faktaunderlaget." if self.lang == "sv" else "Could not build summary sections from the fact base."
+                    return
             else:
-                summaries_text = "\\n\\n".join(batch_summaries)
+                summaries_text = "\n".join(formatted_facts)
                 if len(summaries_text) <= 14000:
                     try:
                         prompt = reduce_template.format(
                             existing_summaries=summaries_text,
                             target_words=target_words,
+                            min_target_words=min_target_words,
+                            max_target_words=max_target_words,
                             focus=self.focus,
                             style=self.style
                         )
@@ -998,12 +1436,12 @@ Final summary:"""
                         return
                 else:
                     reduction_round = 1
-                    combined_level = batch_summaries
+                    combined_level = formatted_facts
                     while len(combined_level) > 1:
                         if self._check_cancelled():
                             return
                         next_level = []
-                        group_size = 4 if len(combined_level) > 6 else 3
+                        group_size = 18 if len(combined_level) > 30 else 10
                         total_groups = (len(combined_level) + group_size - 1) // group_size
                         for group_idx in range(total_groups):
                             if self._check_cancelled():
@@ -1013,19 +1451,18 @@ Final summary:"""
                             if len(group) == 1:
                                 next_level.append(group[0])
                                 continue
-                            if self.progress_callback:
-                                percentage = min(85 + reduction_round * 3, 94)
-                                self.progress_callback(
-                                    "combining",
-                                    group_idx + 1,
-                                    total_groups,
-                                    percentage,
-                                    (
-                                        f"Kombinerar delsammanfattningar, omgång {reduction_round} ({group_idx + 1}/{total_groups})..."
-                                        if self.lang == "sv"
-                                        else f"Combining partial summaries, round {reduction_round} ({group_idx + 1}/{total_groups})..."
-                                    ),
-                                )
+                            percentage = min(85 + reduction_round * 3, 94)
+                            self._update_progress(
+                                "combining",
+                                group_idx + 1,
+                                total_groups,
+                                percentage,
+                                (
+                                    f"Kombinerar delsammanfattningar, omgång {reduction_round} ({group_idx + 1}/{total_groups})..."
+                                    if self.lang == "sv"
+                                    else f"Combining partial summaries, round {reduction_round} ({group_idx + 1}/{total_groups})..."
+                                ),
+                            )
                             try:
                                 next_level.append(self._reduce_summary_group(llm, reduce_template, group, target_words))
                             except Exception as e:
@@ -1035,116 +1472,134 @@ Final summary:"""
                         reduction_round += 1
                     combined_summary = combined_level[0]
 
+            use_deterministic_sections = True
+
             # ===== STEP 4: Final polish =====
             if self._check_cancelled():
                 return
             if self.use_refine:
-                if self.progress_callback:
-                    self.progress_callback(
+                if use_deterministic_sections:
+                    self._update_progress(
+                        "polishing",
+                        total_batches,
+                        total_batches,
+                        95,
+                        "Färdigställer struktur..." if self.lang == "sv" else "Finalizing structure..."
+                    )
+                    self.result = combined_summary
+                else:
+                    refine_min_words = min_target_words
+                    refine_max_words = max_target_words
+                    if self.target_pages > 1:
+                        current_words = _word_count(combined_summary)
+                        refine_min_words = max(current_words, int(target_words * 0.9))
+                        refine_max_words = max(current_words, int(target_words * 1.05))
+                    self._update_progress(
                         "polishing",
                         total_batches,
                         total_batches,
                         95,
                         "Färdigställer..." if self.lang == "sv" else "Finalizing..."
                     )
-                try:
-                    final_prompt_text = final_prompt.format(
-                        current_summary=combined_summary,
-                        target_words=target_words,
-                        style=self.style,
-                        focus=self.focus
-                    )
-                    final_summary = llm.invoke(final_prompt_text).content
-                except Exception as e:
-                    self.error = str(e)
-                    return
-                self.result = final_summary
+                    try:
+                        final_prompt_text = final_prompt.format(
+                            current_summary=combined_summary,
+                            target_words=target_words,
+                            min_target_words=refine_min_words,
+                            max_target_words=refine_max_words,
+                            style=self.style,
+                            focus=self.focus
+                        )
+                        final_summary = llm.invoke(final_prompt_text).content
+                    except Exception as e:
+                        self.error = str(e)
+                        return
+                    self.result = final_summary
             else:
                 self.result = combined_summary
 
-            # Stricter citation verification for summaries
-            if self.docs and not _has_citations(self.result, self.lang):
-                sources_list = _build_sources_list(self.docs, self.lang)
-                self.result = _citation_fix(self.result, self.lang, llm, sources_list)
-                if not _has_citations(self.result, self.lang):
-                    warning = "\n\nOBS: Källor kunde inte verifieras." if self.lang == "sv" else "\n\nNote: Citations could not be verified."
-                    self.result += warning
+            self.result = _strip_summary_artifacts(self.result)
+
+            current_words = _word_count(self.result)
+
+            quality_failures = []
+            if current_words < max(400, int(target_words * 0.5)):
+                quality_failures.append(
+                    (
+                        f"Sammanfattningen blev för kort i förhållande till målet ({current_words} av {target_words} ord)."
+                        if self.lang == "sv"
+                        else f"The summary was too short relative to the target ({current_words} of {target_words} words)."
+                    )
+                )
+            if not _has_citations(self.result, self.lang):
+                quality_failures.append(
+                    "Sammanfattningen saknar verifierbara källhänvisningar."
+                    if self.lang == "sv"
+                    else "The summary is missing verifiable citations."
+                )
+            if quality_failures:
+                self.error = " ".join(quality_failures)
+                self.result = None
+                return
+            self._update_progress(
+                "complete",
+                total_batches,
+                total_batches,
+                100,
+                "Sammanfattning klar." if self.lang == "sv" else "Summary complete.",
+            )
         except Exception as e:
             self.error = str(e)
 
 
-def start_summary(docs, target_pages, focus, style, words_per_page, lang, use_refine):
+def start_summary(docs, target_pages, focus, style, words_per_page, lang, use_refine, force_refresh=False):
     st.session_state.last_target_words = target_pages * words_per_page
+    st.session_state.last_target_pages = target_pages
+    st.session_state.last_words_per_page = words_per_page
     st.session_state.last_focus = focus
     st.session_state.last_style = style
     st.session_state.last_use_refine = use_refine
 
     doc_hash = generate_doc_hash(docs)
     target_words = target_pages * words_per_page
+    model_key = st.session_state.get("llm_model", DEFAULT_LLM_MODEL)
+    st.session_state.summary_used_cache = False
 
-    cached = get_cached_summary(doc_hash, focus, style, target_words, use_refine)
+    cached = None if force_refresh else get_cached_summary(doc_hash, focus, style, target_words, use_refine, model_key, lang)
     if cached:
         st.session_state.last_summary = cached
         st.session_state.summary_result = cached
-        st.success("Cache anvand." if lang == "sv" else "Cache used.")
+        st.session_state.summary_used_cache = True
+        st.success("Cache använd." if lang == "sv" else "Cache used.")
         return
 
-    model_key = st.session_state.get("llm_model", DEFAULT_LLM_MODEL)
-    thread = SummaryThread(docs, model_key, target_pages, focus, style, words_per_page, lang, use_refine, update_summary_progress)
+    thread = SummaryThread(docs, model_key, target_pages, focus, style, words_per_page, lang, use_refine, None)
     st.session_state.summary_thread = thread
     st.session_state.summary_progress = 0
     st.session_state.summary_total = len(docs)
     st.session_state.summary_running = True
     st.session_state.summary_result = None
     st.session_state.summary_error = None
+    st.session_state.summary_started_at = time.time()
+    st.session_state.summary_message = "Förbereder sammanfattningen..." if lang == "sv" else "Preparing summary..."
     thread.start()
 
 
 def update_summary_progress(stage, current, total, percentage, message):
-    """Enhanced progress callback with detailed stage information."""
-    # Initialize session state variables if they don't exist (for background thread safety)
-    if "summary_stage" not in st.session_state:
-        st.session_state.summary_stage = stage
-    else:
-        st.session_state.summary_stage = stage
-    
-    if "summary_current_batch" not in st.session_state:
-        st.session_state.summary_current_batch = current
-    else:
-        st.session_state.summary_current_batch = current
-        
-    if "summary_total_batches" not in st.session_state:
-        st.session_state.summary_total_batches = total
-    else:
-        st.session_state.summary_total_batches = total
-        
-    if "summary_percentage" not in st.session_state:
-        st.session_state.summary_percentage = percentage
-    else:
-        st.session_state.summary_percentage = percentage
-    
-    # Add to log if message changed
-    if message:
-        # Initialize log if it doesn't exist
-        if "summary_stages_log" not in st.session_state:
-            st.session_state.summary_stages_log = []
-            
-        log_entry = {
-            "stage": stage,
-            "message": message,
-            "timestamp": time.time(),
-            "percentage": percentage
-        }
-        if not st.session_state.summary_stages_log or st.session_state.summary_stages_log[-1]["message"] != message:
-            st.session_state.summary_stages_log.append(log_entry)
-    
-        # Keep log manageable - max 50 entries
-        if len(st.session_state.summary_stages_log) > 50:
-            st.session_state.summary_stages_log = st.session_state.summary_stages_log[-50:]
+    """Legacy hook kept for compatibility."""
+    return None
 
 def check_summary_status():
     if st.session_state.get("summary_running", False):
         thread = st.session_state.get("summary_thread")
+        if thread:
+            progress_info = getattr(thread, "progress_info", None) or {}
+            st.session_state.summary_stage = progress_info.get("stage", st.session_state.get("summary_stage", "processing"))
+            st.session_state.summary_current_batch = progress_info.get("current", st.session_state.get("summary_current_batch", 0))
+            st.session_state.summary_total_batches = progress_info.get("total", st.session_state.get("summary_total_batches", 0))
+            st.session_state.summary_percentage = progress_info.get("percentage", st.session_state.get("summary_percentage", 0))
+            st.session_state.summary_message = progress_info.get("message", st.session_state.get("summary_message", ""))
+            st.session_state.summary_stages_log = progress_info.get("log", st.session_state.get("summary_stages_log", []))
         if thread and not thread.is_alive():
             if thread.error:
                 st.session_state.summary_error = thread.error
@@ -1165,7 +1620,9 @@ def check_summary_status():
                     focus = st.session_state.get("last_focus", "")
                     style = st.session_state.get("last_style", "neutral")
                     use_refine = st.session_state.get("last_use_refine", True)
-                    set_cached_summary(doc_hash, focus, style, target_words, use_refine, thread.result)
+                    model_key = st.session_state.get("llm_model", DEFAULT_LLM_MODEL)
+                    lang = st.session_state.get("lang", "sv")
+                    set_cached_summary(doc_hash, focus, style, target_words, use_refine, model_key, lang, thread.result)
                     
             st.session_state.summary_running = False
             st.session_state.summary_thread = None
@@ -1309,6 +1766,49 @@ def _has_citations(text, lang):
     return bool(re.search(r"\[Source:\s*[^\]]+\]", text))
 
 
+def _strip_summary_artifacts(text):
+    if not text:
+        return text
+    artifact_headers = [
+        "Källor:",
+        "Källhänvisningar:",
+        "Referenser:",
+        "Noter:",
+        "Sources:",
+        "Citations:",
+        "References:",
+        "Notes:",
+        "Updated text with citations:",
+        "Uppdaterad text med källor:",
+    ]
+    artifact_prefixes = [
+        "Jag har lagt till tydliga källhänvisningar",
+        "Här är den updaterade texten",
+        "Här är den uppdaterade texten",
+        "I have added clear citations",
+        "Here is the updated text",
+    ]
+    lines = text.splitlines()
+    cleaned = []
+    stop_rest = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        if any(line.startswith(prefix) for prefix in artifact_prefixes):
+            continue
+        if any(line.startswith(header) for header in artifact_headers):
+            stop_rest = True
+        if stop_rest:
+            continue
+        cleaned.append(raw_line)
+    text = "\n".join(cleaned).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def _word_count(text):
+    return len(re.findall(r"\b\w+\b", text or "", flags=re.UNICODE))
+
+
 def _citation_fix(text, lang, llm, sources_list):
     if not sources_list:
         return text
@@ -1331,7 +1831,7 @@ Text:
 
 Updated text with citations:"""
     try:
-        return llm.invoke(prompt).content
+        return _strip_summary_artifacts(llm.invoke(prompt).content)
     except Exception:
         return text
 
@@ -1609,27 +2109,6 @@ def analyze_sentiment(text, pipe):
         return pipe(text[:512])[0]
     except Exception as e:
         return {"label": "Error", "score": 0.0}
-
-# ---------- Export ----------
-def export_text(text): return text.encode()
-def export_docx(text):
-    doc = DocxDocument()
-    doc.add_paragraph(text)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
-        doc.save(tmp.name)
-        with open(tmp.name, "rb") as f: data = f.read()
-    os.unlink(tmp.name); return data
-def export_pdf(text):
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", size=12)
-    for line in text.split('\n'):
-        pdf.multi_cell(0, 10, line)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        pdf.output(tmp.name)
-        with open(tmp.name, "rb") as f: data = f.read()
-    os.unlink(tmp.name); return data
-def export_markdown(text): return text.encode()
 
 # -------------------------------------------------------------------
 # UI Custom CSS (unchanged)
@@ -2491,10 +2970,15 @@ def main():
         "summary_current_batch": 0,
         "summary_total_batches": 0,
         "summary_percentage": 0,
+        "summary_message": "",
+        "summary_started_at": 0.0,
+        "summary_used_cache": False,
         "summary_cancel_requested": False,
         "summary_focus": "",
         "summary_target_pages": 5,
         "summary_words_per_page": 300,
+        "last_target_pages": 0,
+        "last_words_per_page": 0,
         "summary_style": "neutral",
         "summary_use_refine": True,
         "reporter_template": "",
@@ -2725,7 +3209,8 @@ def main():
                     key=f"use-preset-{preset['key']}",
                     use_container_width=True,
                 ):
-                    st.session_state.llm_model = preset["llm_model"]
+                    resolved_preset_model = resolve_installed_ollama_model(preset["llm_model"], installed_models)
+                    st.session_state.llm_model = resolved_preset_model or preset["llm_model"]
                     st.session_state.embedding_model = preset["embedding_model"]
                     get_startup_checks.clear()
                     load_llm.clear()
@@ -2751,6 +3236,41 @@ def main():
                 if llm_model != st.session_state.get("llm_model", DEFAULT_LLM_MODEL):
                     st.session_state.llm_model = llm_model
                     st.rerun()
+                current_selected_model = st.session_state.get("llm_model", DEFAULT_LLM_MODEL)
+                current_selected_resolved = resolve_installed_ollama_model(current_selected_model, installed_models)
+                if current_selected_resolved:
+                    st.caption(
+                        (
+                            f"Vald modell är installerad: {current_selected_resolved}"
+                            if lang == "sv"
+                            else f"Selected model is installed: {current_selected_resolved}"
+                        )
+                    )
+                else:
+                    st.warning(
+                        (
+                            f"Vald modell är inte installerad ännu: {current_selected_model}"
+                            if lang == "sv"
+                            else f"Selected model is not installed yet: {current_selected_model}"
+                        )
+                    )
+                    if st.button("Ladda ner nuvarande modell" if lang == "sv" else "Download current model", use_container_width=True):
+                        with st.spinner(("Laddar ner modell..." if lang == "sv" else "Downloading model...")):
+                            try:
+                                pull_ollama_model(current_selected_model)
+                                refreshed_models = get_installed_ollama_models()
+                                refreshed_resolved = resolve_installed_ollama_model(current_selected_model, refreshed_models)
+                                st.session_state.llm_model = refreshed_resolved or current_selected_model
+                                st.success(
+                                    (
+                                        f"Modellen {st.session_state.llm_model} är installerad och vald."
+                                        if lang == "sv"
+                                        else f"Model {st.session_state.llm_model} is installed and selected."
+                                    )
+                                )
+                                st.rerun()
+                            except Exception as exc:
+                                st.error((f"Kunde inte ladda ner modellen: {exc}" if lang == "sv" else f"Could not download model: {exc}"))
                 missing_known_models = [model for model in LLM_MODELS.keys() if model not in installed_models]
                 if missing_known_models:
                     download_target = st.selectbox(
@@ -2763,8 +3283,10 @@ def main():
                         with st.spinner(("Laddar ner modell..." if lang == "sv" else "Downloading model...")):
                             try:
                                 pull_ollama_model(download_target)
+                                refreshed_models = get_installed_ollama_models()
+                                refreshed_resolved = resolve_installed_ollama_model(download_target, refreshed_models)
                                 st.success((f"Modellen {download_target} är installerad." if lang == "sv" else f"Model {download_target} is installed."))
-                                st.session_state.llm_model = download_target
+                                st.session_state.llm_model = refreshed_resolved or download_target
                                 st.rerun()
                             except Exception as exc:
                                 st.error((f"Kunde inte ladda ner modellen: {exc}" if lang == "sv" else f"Could not download model: {exc}"))
@@ -3306,11 +3828,22 @@ def main():
                 focus = st.text_area(get_text("focus"), placeholder="t.ex. korruption, specifik person..." if lang == "sv" else "e.g., corruption, specific person...", height=90, disabled=st.session_state.processing, key="summary_focus")
                 style = st.selectbox(get_text("style"), ["neutral", "investigative", "dramatic", "formal"], disabled=st.session_state.processing, key="summary_style")
                 use_refine = st.checkbox(get_text("refine_btn"), value=st.session_state.get("summary_use_refine", True), disabled=st.session_state.processing, key="summary_use_refine")
+                force_refresh = st.checkbox(
+                    "Ignorera cache och kör om från början" if lang == "sv" else "Ignore cache and run fresh",
+                    value=False,
+                    disabled=st.session_state.processing or st.session_state.summary_running,
+                    key="summary_force_refresh",
+                )
             with col_preview:
-                target_pages = st.slider(get_text("target_pages"), 1, 50, st.session_state.get("summary_target_pages", 5), disabled=st.session_state.processing, key="summary_target_pages")
-                words_per_page = st.number_input(get_text("density"), 100, 500, st.session_state.get("summary_words_per_page", 300), disabled=st.session_state.processing, key="summary_words_per_page")
+                target_pages = int(st.number_input(get_text("target_pages"), min_value=1, max_value=200, value=int(st.session_state.get("summary_target_pages", 5)), step=1, disabled=st.session_state.processing, key="summary_target_pages"))
+                words_per_page = int(st.number_input(get_text("density"), min_value=80, max_value=700, value=int(st.session_state.get("summary_words_per_page", 300)), step=10, disabled=st.session_state.processing, key="summary_words_per_page"))
                 target_words = int(target_pages * words_per_page)
                 st.caption(f"{get_text('summary_estimate')}: {target_words} {'ord' if lang=='sv' else 'words'}")
+                st.caption(
+                    "Detta är en mållängd, inte ett löfte. Appen visar faktisk utdata efter körningen."
+                    if lang == "sv"
+                    else "This is a target length, not a guarantee. The app shows actual output after the run."
+                )
             if st.button(get_text("summarize_btn"), disabled=st.session_state.processing or st.session_state.summary_running, use_container_width=True):
                 st.session_state.summary_stage = "initializing"
                 st.session_state.summary_stages_log = []
@@ -3318,21 +3851,35 @@ def main():
                 st.session_state.summary_current_batch = 0
                 st.session_state.summary_total_batches = 0
                 st.session_state.summary_cancel_requested = False
-                start_summary(st.session_state.docs, target_pages, focus, style, words_per_page, st.session_state.lang, use_refine)
+                start_summary(st.session_state.docs, target_pages, focus, style, words_per_page, st.session_state.lang, use_refine, force_refresh=force_refresh)
                 st.rerun()
         if st.session_state.summary_running:
             stage = st.session_state.get("summary_stage", "processing")
-            percentage = st.session_state.get("summary_percentage", 0)
             current_batch = st.session_state.get("summary_current_batch", 0)
             total_batches = st.session_state.get("summary_total_batches", 0)
+            message = st.session_state.get("summary_message", "")
+            elapsed_seconds = max(0, int(time.time() - st.session_state.get("summary_started_at", time.time())))
+            elapsed_label = f"{elapsed_seconds // 60}:{elapsed_seconds % 60:02d}"
+            requested_pages = st.session_state.get("last_target_pages", 0)
+            requested_density = st.session_state.get("last_words_per_page", 0)
+            requested_words = st.session_state.get("last_target_words", 0)
             stage_labels = {"idle": "Väntar" if lang == "sv" else "Idle", "initializing": "Initierar" if lang == "sv" else "Initializing", "processing": "Sammanfattar avsnitt" if lang == "sv" else "Processing sections", "combining": "Kombinerar" if lang == "sv" else "Combining", "polishing": "Färdigställer" if lang == "sv" else "Finalizing", "complete": "Klart" if lang == "sv" else "Complete", "error": "Fel" if lang == "sv" else "Error", "cancelled": "Avbrutet" if lang == "sv" else "Cancelled"}
-            st.markdown(f'<div class="info-box"><strong>{stage_labels.get(stage, stage)}</strong><span style="float:right;">{percentage:.0f}%</span></div>', unsafe_allow_html=True)
-            st.progress(percentage / 100.0)
+            st.markdown(f'<div class="info-box"><strong>{stage_labels.get(stage, stage)}</strong><span style="float:right;">{elapsed_label}</span></div>', unsafe_allow_html=True)
+            if message:
+                st.caption(message)
+            if requested_pages and requested_density and requested_words:
+                st.caption(
+                    f"Mål: {requested_pages} sidor x {requested_density} ord/sida = {requested_words} ord"
+                    if lang == "sv"
+                    else f"Target: {requested_pages} pages x {requested_density} words/page = {requested_words} words"
+                )
             if stage == "processing" and total_batches > 0:
-                st.caption(f"Batch {current_batch} / {total_batches}")
+                st.caption(f"Avsnitt {current_batch} / {total_batches}" if lang == "sv" else f"Section {current_batch} / {total_batches}")
+            elif stage == "combining" and total_batches > 0:
+                st.caption(f"Kombineringssteg {current_batch} / {total_batches}" if lang == "sv" else f"Combine step {current_batch} / {total_batches}")
             with st.expander("Logg" if lang == "sv" else "Log"):
                 for entry in st.session_state.get("summary_stages_log", [])[-10:]:
-                    st.caption(f"{entry.get('percentage', 0):.0f}% - {entry.get('message', '')}")
+                    st.caption(entry.get("message", ""))
             if st.button("Avbryt" if lang == "sv" else "Cancel", key="cancel_summary"):
                 if st.session_state.get("summary_thread"):
                     st.session_state.summary_thread.stop()
@@ -3347,10 +3894,42 @@ def main():
                 st.markdown(f'<div class="warning-box">{"Fel: " if lang=="sv" else "Error: "}{error_msg}</div>', unsafe_allow_html=True)
         elif st.session_state.summary_result:
             st.markdown("### " + ("Sammanfattning" if lang == "sv" else "Summary"))
+            if st.session_state.get("summary_used_cache"):
+                st.info("Visar en cachad sammanfattning för nuvarande dokument och inställningar." if lang == "sv" else "Showing a cached summary for the current documents and settings.")
+            requested_pages = st.session_state.get("last_target_pages", 0)
+            requested_density = st.session_state.get("last_words_per_page", 0)
+            requested_words = st.session_state.get("last_target_words", 0)
+            if requested_pages and requested_density and requested_words:
+                st.caption(
+                    f"Begärd längd: {requested_pages} sidor x {requested_density} ord/sida = {requested_words} ord"
+                    if lang == "sv"
+                    else f"Requested length: {requested_pages} pages x {requested_density} words/page = {requested_words} words"
+                )
+            actual_words = _word_count(st.session_state.summary_result)
+            st.caption(
+                f"Faktisk längd: {actual_words} ord"
+                if lang == "sv"
+                else f"Actual length: {actual_words} words"
+            )
+            if requested_words and actual_words < int(requested_words * 0.75):
+                st.warning(
+                    (
+                        f"Sammanfattningen blev betydligt kortare än målet ({actual_words} av {requested_words} ord). Appen kunde inte nå önskad längd på ett tillförlitligt sätt."
+                        if lang == "sv"
+                        else f"The summary came out much shorter than the target ({actual_words} of {requested_words} words). The app could not reliably reach the requested length."
+                    )
+                )
+            verified_summary, summary_issues = verify_citations(
+                st.session_state.summary_result,
+                st.session_state.get("raw_pages") or [],
+                lang,
+            )
+            if verified_summary != st.session_state.summary_result:
+                st.session_state.summary_result = verified_summary
             summary_confidence = assess_answer_confidence(
                 st.session_state.summary_result,
                 st.session_state.get("raw_pages") or [],
-                ["missing_citations"] if not ("[Source:" in st.session_state.summary_result or "[Källa:" in st.session_state.summary_result) else [],
+                summary_issues if summary_issues else (["missing_citations"] if not ("[Source:" in st.session_state.summary_result or "[Källa:" in st.session_state.summary_result) else []),
                 lang,
             )
             render_confidence_banner(summary_confidence, lang)

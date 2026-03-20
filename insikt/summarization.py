@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import Sequence
 
 from langchain_ollama import ChatOllama
@@ -28,6 +29,15 @@ class SummaryThread(threading.Thread):
         self.result = None
         self.error = None
         self._stop_event = threading.Event()
+        self.progress_info = {
+            "stage": "idle",
+            "current": 0,
+            "total": 0,
+            "percentage": 0,
+            "message": "",
+            "log": [],
+            "updated_at": time.time(),
+        }
 
     def stop(self):
         self._stop_event.set()
@@ -37,6 +47,28 @@ class SummaryThread(threading.Thread):
             self.error = "cancelled"
             return True
         return False
+
+    def _update_progress(self, stage, current, total, percentage, message):
+        log = list(self.progress_info.get("log", []))
+        if message and (not log or log[-1]["message"] != message):
+            log.append(
+                {
+                    "stage": stage,
+                    "message": message,
+                    "timestamp": time.time(),
+                    "percentage": percentage,
+                }
+            )
+            log = log[-50:]
+        self.progress_info = {
+            "stage": stage,
+            "current": current,
+            "total": total,
+            "percentage": percentage,
+            "message": message,
+            "log": log,
+            "updated_at": time.time(),
+        }
 
     def _build_batches(self, max_chars=None, max_chunks=None):
         doc_count = len(self.docs)

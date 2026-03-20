@@ -38,7 +38,18 @@ class SummaryThread(threading.Thread):
             return True
         return False
 
-    def _build_batches(self, max_chars=12000, max_chunks=8):
+    def _build_batches(self, max_chars=None, max_chunks=None):
+        doc_count = len(self.docs)
+        if max_chars is None or max_chunks is None:
+            if doc_count >= 400:
+                max_chars = 32000
+                max_chunks = 20
+            elif doc_count >= 120:
+                max_chars = 24000
+                max_chunks = 16
+            else:
+                max_chars = 16000
+                max_chunks = 10
         batches = []
         current = []
         current_chars = 0
@@ -57,10 +68,19 @@ class SummaryThread(threading.Thread):
             batches.append("".join(current))
         return batches
 
+    def _reduce_summary_group(self, llm, reduce_template, summaries, target_words):
+        prompt = reduce_template.format(
+            focus=self.focus,
+            style=self.style,
+            target_words=target_words,
+            existing_summaries="\n\n".join(summaries),
+        )
+        return llm.invoke(prompt).content
+
     def run(self):
         try:
-            target_words = min(max(150, self.target_pages * self.words_per_page), 4000)
-            llm = ChatOllama(model=self.llm_model, temperature=0.2, num_predict=min(max(int(target_words * 1.3), 512), 4096))
+            target_words = max(150, self.target_pages * self.words_per_page)
+            llm = ChatOllama(model=self.llm_model, temperature=0.2, num_predict=max(int(target_words * 1.3), 512))
             batches = self._build_batches()
 
             if self.lang == "sv":
@@ -123,7 +143,31 @@ Final summary:"""
             combined = "\n\n".join(batch_summaries)
             if self.progress_callback:
                 self.progress_callback("combining", total_batches, total_batches, 82, "Combining summaries")
-            combined = llm.invoke(reduce_template.format(focus=self.focus, style=self.style, target_words=target_words, existing_summaries=combined)).content
+            if len(combined) <= 14000:
+                combined = llm.invoke(reduce_template.format(focus=self.focus, style=self.style, target_words=target_words, existing_summaries=combined)).content
+            else:
+                reduction_round = 1
+                combined_level = batch_summaries
+                while len(combined_level) > 1:
+                    if self._check_cancelled():
+                        return
+                    next_level = []
+                    group_size = 4 if len(combined_level) > 6 else 3
+                    total_groups = (len(combined_level) + group_size - 1) // group_size
+                    for group_idx in range(total_groups):
+                        if self._check_cancelled():
+                            return
+                        start = group_idx * group_size
+                        group = combined_level[start:start + group_size]
+                        if len(group) == 1:
+                            next_level.append(group[0])
+                            continue
+                        if self.progress_callback:
+                            self.progress_callback("combining", group_idx + 1, total_groups, min(82 + reduction_round * 4, 94), f"Combine round {reduction_round} ({group_idx + 1}/{total_groups})")
+                        next_level.append(self._reduce_summary_group(llm, reduce_template, group, target_words))
+                    combined_level = next_level
+                    reduction_round += 1
+                combined = combined_level[0]
 
             if self.use_refine:
                 if self.progress_callback:

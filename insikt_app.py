@@ -845,7 +845,18 @@ class SummaryThread(threading.Thread):
             return True
         return False
 
-    def _build_batches(self, max_chars=12000, max_chunks=8):
+    def _build_batches(self, max_chars=None, max_chunks=None):
+        doc_count = len(self.docs)
+        if max_chars is None or max_chunks is None:
+            if doc_count >= 400:
+                max_chars = 32000
+                max_chunks = 20
+            elif doc_count >= 120:
+                max_chars = 24000
+                max_chunks = 16
+            else:
+                max_chars = 16000
+                max_chunks = 10
         batches = []
         current = []
         current_chars = 0
@@ -866,22 +877,19 @@ class SummaryThread(threading.Thread):
             batches.append("".join(current))
         return batches
 
+    def _reduce_summary_group(self, llm, reduce_template, summaries, target_words):
+        prompt = reduce_template.format(
+            existing_summaries="\n\n".join(summaries),
+            target_words=target_words,
+            focus=self.focus,
+            style=self.style,
+        )
+        return llm.invoke(prompt).content
+
     def run(self):
         try:
             target_words = max(150, self.target_pages * self.words_per_page)
-            max_target_words = 4000
-            if target_words > max_target_words:
-                target_words = max_target_words
-                if self.progress_callback:
-                    self.progress_callback(
-                        "initializing",
-                        0,
-                        0,
-                        5,
-                        "Målslängd kapad för att matcha modellens gräns." if self.lang == "sv" else "Target length capped to fit model limits."
-                    )
-
-            num_predict = min(max(int(target_words * 1.3), 512), 4096)
+            num_predict = max(int(target_words * 1.3), 512)
             llm = ChatOllama(model=self.llm_model, temperature=0.2, num_predict=num_predict)
 
             # ===== STEP 1: BATCH CHUNKS TOGETHER =====
@@ -989,22 +997,43 @@ Final summary:"""
                         self.error = str(e)
                         return
                 else:
-                    combined = batch_summaries[0]
-                    for i in range(1, len(batch_summaries)):
+                    reduction_round = 1
+                    combined_level = batch_summaries
+                    while len(combined_level) > 1:
                         if self._check_cancelled():
                             return
-                        try:
-                            prompt = reduce_template.format(
-                                existing_summaries=combined,
-                                target_words=target_words,
-                                focus=self.focus,
-                                style=self.style
-                            )
-                            combined = llm.invoke(prompt).content
-                        except Exception as e:
-                            self.error = str(e)
-                            return
-                    combined_summary = combined
+                        next_level = []
+                        group_size = 4 if len(combined_level) > 6 else 3
+                        total_groups = (len(combined_level) + group_size - 1) // group_size
+                        for group_idx in range(total_groups):
+                            if self._check_cancelled():
+                                return
+                            start = group_idx * group_size
+                            group = combined_level[start:start + group_size]
+                            if len(group) == 1:
+                                next_level.append(group[0])
+                                continue
+                            if self.progress_callback:
+                                percentage = min(85 + reduction_round * 3, 94)
+                                self.progress_callback(
+                                    "combining",
+                                    group_idx + 1,
+                                    total_groups,
+                                    percentage,
+                                    (
+                                        f"Kombinerar delsammanfattningar, omgång {reduction_round} ({group_idx + 1}/{total_groups})..."
+                                        if self.lang == "sv"
+                                        else f"Combining partial summaries, round {reduction_round} ({group_idx + 1}/{total_groups})..."
+                                    ),
+                                )
+                            try:
+                                next_level.append(self._reduce_summary_group(llm, reduce_template, group, target_words))
+                            except Exception as e:
+                                self.error = str(e)
+                                return
+                        combined_level = next_level
+                        reduction_round += 1
+                    combined_summary = combined_level[0]
 
             # ===== STEP 4: Final polish =====
             if self._check_cancelled():
@@ -3238,7 +3267,7 @@ def main():
                 "- Kan förfina sluttexten i ett extra steg.\n\n"
                 "### Bra att veta\n"
                 "- För stora dokument kan första körningen ta tid.\n"
-                "- Längre måltext kan kapas för att hålla svaren stabila."
+                "- Längre måltext tar längre tid eftersom fler modellsteg och mer text behöver genereras."
             )
             if lang == "sv"
             else
@@ -3249,7 +3278,7 @@ def main():
                 "- Can refine the final text in an extra step.\n\n"
                 "### Good to know\n"
                 "- Large document sets may take time on the first run.\n"
-                "- Very long targets may be capped to keep output stable."
+                "- Longer targets take more time because the model has to generate and merge more text."
             ),
         )
         template_labels = get_reporter_template_options(lang)
@@ -3282,8 +3311,6 @@ def main():
                 words_per_page = st.number_input(get_text("density"), 100, 500, st.session_state.get("summary_words_per_page", 300), disabled=st.session_state.processing, key="summary_words_per_page")
                 target_words = int(target_pages * words_per_page)
                 st.caption(f"{get_text('summary_estimate')}: {target_words} {'ord' if lang=='sv' else 'words'}")
-                if target_words > 4000:
-                    st.warning("Långt sammanfattningsmål. För hastighet kapas längden vid 4000 ord." if lang == "sv" else "Long target length. For speed, output is capped at 4000 words.")
             if st.button(get_text("summarize_btn"), disabled=st.session_state.processing or st.session_state.summary_running, use_container_width=True):
                 st.session_state.summary_stage = "initializing"
                 st.session_state.summary_stages_log = []

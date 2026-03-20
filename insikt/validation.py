@@ -48,7 +48,15 @@ REQUIRED_PYTHON_MODULES = [
 
 def get_installed_ollama_models() -> list[str]:
     try:
-        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=5, check=False)
+        result = subprocess.run(
+            ["ollama", "list"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
         if result.returncode != 0:
             return []
         models = []
@@ -126,6 +134,8 @@ def install_python_packages(packages: list[str]) -> list[str]:
         [sys.executable, "-m", "pip", "install", *unique_packages],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=1800000,
         check=False,
     )
@@ -293,7 +303,15 @@ def run_startup_checks(llm_model: str, embedding_model: str) -> list[dict]:
     checks.append({"name": "GPU readiness", "status": gpu_status, "message": gpu_message})
     try:
         installed_models = get_installed_ollama_models()
-        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=5, check=False)
+        result = subprocess.run(
+            ["ollama", "list"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
         has_ollama = result.returncode == 0
         checks.append({"name": "Ollama", "status": "ok" if has_ollama else "warning", "message": "Ollama responded successfully." if has_ollama else "Ollama did not respond. Start it before using chat or summaries."})
         resolved_model = resolve_installed_ollama_model(llm_model, installed_models)

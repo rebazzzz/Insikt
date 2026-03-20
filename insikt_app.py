@@ -2930,7 +2930,15 @@ def render_system_check(check: dict, lang: str):
 
 
 def pull_ollama_model(model_name: str):
-    result = subprocess.run(["ollama", "pull", model_name], capture_output=True, text=True, timeout=1800000, check=False)
+    result = subprocess.run(
+        ["ollama", "pull", model_name],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=1800000,
+        check=False,
+    )
     get_startup_checks.clear()
     load_llm.clear()
     if result.returncode != 0:

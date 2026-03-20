@@ -19,14 +19,15 @@ def analyze_query_complexity(query: str) -> int:
     analytical_keywords = [
         "compare", "analyze", "explain", "why", "how", "difference",
         "relationship", "impact", "effect", "cause", "result", "consequence",
-        "jämför", "analysera", "förklara", "varför", "hur", "skillnad",
-        "relation", "påverkan", "effekt", "orsak", "resultat", "konsekvens",
+        "jamfor", "jämför", "analysera", "forklara", "förklara", "varfor", "varför",
+        "hur", "skillnad", "relation", "paverkan", "påverkan", "effekt", "orsak",
+        "resultat", "konsekvens",
     ]
     for keyword in analytical_keywords:
         if keyword in query_lower:
             score += 2
 
-    if any(word in query_lower for word in ["vs", "versus", "compared", "jämfört"]):
+    if any(word in query_lower for word in ["vs", "versus", "compared", "jamfort", "jämfört"]):
         score += 2
 
     if score <= 2:
@@ -95,38 +96,83 @@ def build_history_string(history: Sequence, lang: str) -> str:
     return "\n".join(lines)
 
 
-def create_chat_prompt(history, context_docs, query, lang):
+def _build_chat_system_prompt(lang: str, has_context: bool) -> str:
     if lang == "sv":
-        system_template = """
-Du är en hjälpsam och ärlig AI-assistent. Svara bara med stöd i dokumentkontexten när den finns.
-När du använder information från dokumenten måste du ange källa som [Källa: filnamn, sida X].
-Om dokumenten inte räcker ska du säga det tydligt och skilja på dokumentstöd och allmän kunskap.
-Om flera källor säger olika saker ska du säga det.
+        if has_context:
+            return """
+Du är en hjälpsam, varm och ärlig AI-assistent.
+Du får gärna låta mänsklig och samtalsvänlig, men du får aldrig hitta på fakta.
+
+Regler:
+- Använd dokumentkontexten som primär kunskapskälla.
+- När du använder information från dokumenten måste du citera den som [Källa: filnamn, sida X].
+- Om dokumenten inte räcker ska du säga det tydligt.
+- Om frågan inte kan besvaras säkert från materialet ska du säga vad som saknas i stället för att gissa.
+- Om användaren småpratar eller ber om kreativ hjälp får du svara naturligt utan att låtsas att det kommer från dokument.
+- Om du använder allmän kunskap, märk det tydligt som allmän vägledning och håll dig försiktig.
+- Om källor motsäger varandra ska du säga det uttryckligen.
+""".strip()
+        return """
+Du är en hjälpsam, varm och ärlig AI-assistent.
+Det finns inga uppladdade dokument att luta sig mot just nu.
+
+Regler:
+- Var naturlig och samtalsvänlig.
+- Hitta inte på fakta. Om du inte vet, säg det.
+- För faktafrågor ska du vara tydlig med att svaret inte är dokumentverifierat.
+- För småprat, brainstorming, skrivhjälp och allmän vägledning kan du svara direkt, men utan att låtsas vara säker på specifika fakta du inte kan belägga.
+""".strip()
+    if has_context:
+        return """
+You are a helpful, warm, and honest AI assistant.
+Sound human and conversational, but never invent facts.
+
+Rules:
+- Use the document context as your primary knowledge base.
+- When you use document information, cite it as [Source: filename, page X].
+- If the documents are insufficient, say so clearly.
+- If the question cannot be answered safely from the material, explain what is missing instead of guessing.
+- If the user is just chatting or asking for creative help, respond naturally without pretending it came from the documents.
+- If you use general knowledge, label it clearly as general guidance and stay cautious.
+- If sources conflict, say that explicitly.
+""".strip()
+    return """
+You are a helpful, warm, and honest AI assistant.
+There are no uploaded documents available right now.
+
+Rules:
+- Be natural and conversational.
+- Do not make up facts. If you do not know, say so.
+- For factual questions, be clear that the answer is not document-verified.
+- For small talk, brainstorming, writing help, and general guidance, respond directly without pretending certainty about specific facts you cannot support.
+""".strip()
+
+
+def create_chat_prompt(history, context_docs, query, lang):
+    system_prompt = _build_chat_system_prompt(lang, bool(context_docs))
+    if lang == "sv":
+        return f"""
+{system_prompt}
 
 Kontext från dokument:
-{context}
+{build_context_string(context_docs, lang)}
 
 Tidigare konversation:
-{history}
+{build_history_string(history, lang)}
 
 Användare: {query}
-Assistent:"""
-    else:
-        system_template = """
-You are a helpful and honest AI assistant. Answer with support from the document context whenever it exists.
-When you use document information, cite it as [Source: filename, page X].
-If the documents are insufficient, say so clearly and separate document-grounded claims from general knowledge.
-If sources conflict, say that explicitly.
+Assistent:""".strip()
+    return f"""
+{system_prompt}
 
 Context from documents:
-{context}
+{build_context_string(context_docs, lang)}
 
 Conversation history:
-{history}
+{build_history_string(history, lang)}
 
 User: {query}
-Assistant:"""
-    return system_template.format(context=build_context_string(context_docs, lang), history=build_history_string(history, lang), query=query)
+Assistant:""".strip()
 
 
 def extract_citations_from_response(response: str) -> list:
@@ -142,7 +188,7 @@ def extract_citations_from_response(response: str) -> list:
 
 def verify_citations(response: str, context_docs: Sequence[Document], lang: str) -> tuple:
     if not context_docs:
-        return response, ["No context available to verify citations"]
+        return response, ["no_knowledge_base"]
     citations = extract_citations_from_response(response)
     if not citations:
         warning = "\n\nObs: Svaret saknar tydliga källhänvisningar." if lang == "sv" else "\n\nNote: The answer is missing explicit citations."
@@ -179,7 +225,21 @@ def assess_answer_confidence(response: str, context_docs: Sequence[Document], is
     has_severe_issue = any(issue.startswith(severe_issue_prefixes) for issue in issues)
     has_grounding_issue = any(issue.startswith("weak_grounding") for issue in issues)
 
-    if has_severe_issue or not context_docs:
+    if not context_docs:
+        score = 12 if not has_severe_issue else 5
+    else:
+        score = 20
+        score += min(len(unique_citations), 4) * 15
+        score += min(source_count, 3) * 8
+        if has_grounding_issue:
+            score -= 20
+        if has_severe_issue:
+            score -= 35
+        elif not unique_citations:
+            score -= 25
+        score = max(0, min(score, 98))
+
+    if has_severe_issue or score < 40:
         return {
             "level": "needs_review",
             "label": "Behöver granskas" if lang == "sv" else "Needs review",
@@ -187,8 +247,9 @@ def assess_answer_confidence(response: str, context_docs: Sequence[Document], is
             "citation_count": len(unique_citations),
             "source_count": source_count,
             "issues": issues,
+            "score": score,
         }
-    if has_grounding_issue or len(unique_citations) == 1 or source_count == 1:
+    if has_grounding_issue or len(unique_citations) <= 1 or source_count <= 1:
         return {
             "level": "partly_supported",
             "label": "Delvis styrkt" if lang == "sv" else "Partly supported",
@@ -196,6 +257,7 @@ def assess_answer_confidence(response: str, context_docs: Sequence[Document], is
             "citation_count": len(unique_citations),
             "source_count": source_count,
             "issues": issues,
+            "score": score,
         }
     return {
         "level": "well_supported",
@@ -204,6 +266,7 @@ def assess_answer_confidence(response: str, context_docs: Sequence[Document], is
         "citation_count": len(unique_citations),
         "source_count": source_count,
         "issues": issues,
+        "score": score,
     }
 
 
@@ -312,8 +375,12 @@ def chat_with_docs(query, history, vectorstore, llm, lang, source_filter=None):
         response = llm.invoke(prompt).content
     except Exception as exc:
         return (f"Fel vid generering av svar: {exc}" if lang == "sv" else f"Error generating answer: {exc}"), context_docs, ["generation_error"]
-    response, citation_issues = verify_citations(response, context_docs, lang)
-    response, grounding_issues = grounding_check(response, context_docs, lang)
+    if context_docs:
+        response, citation_issues = verify_citations(response, context_docs, lang)
+        response, grounding_issues = grounding_check(response, context_docs, lang)
+    else:
+        citation_issues = ["no_knowledge_base"]
+        grounding_issues = []
     return response, context_docs, citation_issues + grounding_issues
 
 

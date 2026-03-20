@@ -293,6 +293,7 @@ LANGUAGES = {
         "howto": "Ladda upp filer i sidofältet och chatta sedan med dem nedan. Assistenten kan svara på frågor, sammanfatta och analysera dina dokument. Alla svar är baserade på dina dokument när möjligt, med källhänvisning.",
         "upload": "Ladda upp dokument",
         "process_btn": "Bearbeta dokument",
+        "process_kb_btn": "Bygg kunskapsbas",
         "processing": "Bearbetar... Vänligen vänta. Inga andra åtgärder är möjliga just nu.",
         "success_docs": "{} dokument laddade ({} stycken).",
         "error_no_docs": "Ladda upp dokument först.",
@@ -373,6 +374,15 @@ LANGUAGES = {
         "stage_reading": "Läser dokument {} av {}",
         "stage_chunking": "Delar upp dokument i {} segment",
         "stage_embedding": "Skapar vektorer för {} segment",
+        "setup_section": "Kom igång",
+        "documents_section": "Dokument",
+        "saved_work_section": "Sparat arbete",
+        "models_section": "Modeller och prestanda",
+        "system_status_section": "Systemstatus",
+        "selected_files": "{} filer valda",
+        "ready_to_build": "Nästa steg: bygg kunskapsbasen så att appen kan chatta, sammanfatta och analysera filerna.",
+        "no_docs_hint": "1. Ladda upp filer. 2. Klicka på Bygg kunskapsbas.",
+        "uploaded_sources": "Uppladdade källor",
     },
     "en": {
         "title": "Insikt – Journalist AI",
@@ -380,6 +390,7 @@ LANGUAGES = {
         "howto": "Upload files in the sidebar, then chat with them below. The assistant can answer questions, summarize, and analyze your documents. All responses are grounded in your documents when possible, with sources cited.",
         "upload": "Upload Documents",
         "process_btn": "Process Documents",
+        "process_kb_btn": "Build Knowledge Base",
         "processing": "Processing... Please wait. No other actions are possible at this time.",
         "success_docs": "{} docs loaded ({} chunks).",
         "error_no_docs": "Please upload documents first.",
@@ -460,6 +471,15 @@ LANGUAGES = {
         "stage_reading": "Reading document {} of {}",
         "stage_chunking": "Chunking into {} segments",
         "stage_embedding": "Creating vectors for {} segments",
+        "setup_section": "Get started",
+        "documents_section": "Documents",
+        "saved_work_section": "Saved work",
+        "models_section": "Models and performance",
+        "system_status_section": "System status",
+        "selected_files": "{} files selected",
+        "ready_to_build": "Next step: build the knowledge base so the app can chat with, summarize, and analyze the files.",
+        "no_docs_hint": "1. Upload files. 2. Click Build Knowledge Base.",
+        "uploaded_sources": "Uploaded sources",
     }
 }
 
@@ -1545,9 +1565,9 @@ def translate_text(text, target_lang, llm, source_lang):
     except Exception as e:
         return f"Translation failed: {e}"
 
-def extract_keywords(text, top_n=10):
+def extract_keywords(text, top_n=10, language="en"):
     try:
-        kw_extractor = yake.KeywordExtractor(lan="en", top=top_n)
+        kw_extractor = yake.KeywordExtractor(lan=language, top=top_n)
         keywords = kw_extractor.extract_keywords(text)
         return [kw for kw, score in keywords]
     except Exception as e:
@@ -1815,13 +1835,25 @@ def set_custom_css(basic_mode: bool = False):
         padding: 1rem 1.15rem;
         line-height: 1.65;
     }
+    [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
+        justify-content: flex-end;
+    }
     [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) [data-testid="stChatMessageContent"] {
-        background: #e6fffb;
-        border: 1px solid #99f6e4;
+        background: linear-gradient(135deg, #0f766e 0%, #115e59 100%);
+        border: 1px solid #0f766e;
+        color: #ffffff;
+        margin-left: auto;
+        box-shadow: 0 12px 30px rgba(15, 118, 110, 0.18);
     }
     [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) [data-testid="stChatMessageContent"] {
         background: #fffaf5;
         border: 1px solid var(--border);
+        margin-right: auto;
+        box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
+    }
+    [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) [data-testid="stMarkdownContainer"] p,
+    [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) [data-testid="stMarkdownContainer"] li {
+        color: #ffffff;
     }
     .chat-notes {
         margin-top: 0.8rem;
@@ -2244,13 +2276,16 @@ def render_confidence_banner(confidence: dict, lang: str):
         st.info(f"{confidence.get('label')}: {confidence.get('reason')}")
     else:
         st.warning(f"{confidence.get('label')}: {confidence.get('reason')}")
-    st.caption(
-        (
-            f"Källhänvisningar: {confidence.get('citation_count', 0)} | Källdokument: {confidence.get('source_count', 0)}"
-            if lang == "sv"
-            else f"Citations: {confidence.get('citation_count', 0)} | Source documents: {confidence.get('source_count', 0)}"
+    citation_count = int(confidence.get("citation_count", 0) or 0)
+    source_count = int(confidence.get("source_count", 0) or 0)
+    if citation_count > 0:
+        st.caption(
+            (
+                f"Källhänvisningar: {citation_count} | Källdokument: {source_count}"
+                if lang == "sv"
+                else f"Citations: {citation_count} | Source documents: {source_count}"
+            )
         )
-    )
 
 
 def get_llm_option_info(model_key: str) -> dict:
@@ -2448,8 +2483,6 @@ def main():
         "comparison_results": [],
         "comparison_last_run": "",
         "available_sources": [],
-        "chat_source_filter": [],
-        "writing_source_filter": [],
         "selected_preview_source": "",
         "selected_preview_page": "",
         "preview_excerpt": "",
@@ -2524,10 +2557,16 @@ def main():
             st.warning("Ingen kunskapsbas laddad" if lang == "sv" else readiness_text)
         st.caption(get_text("device_current").format(current_device.upper()))
 
-        with st.expander("Setup", expanded=True):
+        with st.expander(get_text("setup_section"), expanded=True):
             st.caption("Snabbstart" if lang == "sv" else "Quick start")
             st.caption(describe_system_profile(system_profile, lang))
-            selected_lang = st.selectbox(get_text("language"), options=["sv", "en"], format_func=lambda x: "Svenska" if x == "sv" else "English")
+            lang_options = ["sv", "en"]
+            selected_lang = st.selectbox(
+                get_text("language"),
+                options=lang_options,
+                index=lang_options.index(st.session_state.get("lang", "sv")),
+                format_func=lambda x: "Svenska" if x == "sv" else "English",
+            )
             if selected_lang != st.session_state.lang:
                 st.session_state.lang = selected_lang
                 st.rerun()
@@ -2600,45 +2639,45 @@ def main():
                             else f"Current model is ready to use: {selected_model_resolved}."
                         )
                     )
-            st.markdown("**Systemstatus**" if lang == "sv" else "**System status**")
-            for check in checks:
-                render_system_check(check, lang)
-            missing_python_packages = get_missing_python_packages()
-            if missing_python_packages:
-                if st.button(
-                    "Installera saknade Python-paket" if lang == "sv" else "Install missing Python packages",
-                    use_container_width=True,
-                ):
-                    with st.spinner("Installerar paket..." if lang == "sv" else "Installing packages..."):
-                        try:
-                            installed_package_names = install_missing_python_packages()
-                            package_list = ", ".join(installed_package_names)
-                            st.success(
-                                f"Installerade: {package_list}"
-                                if lang == "sv"
-                                else f"Installed: {package_list}"
-                            )
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(
-                                f"Kunde inte installera Python-paketen: {exc}"
-                                if lang == "sv"
-                                else f"Could not install the Python packages: {exc}"
-                            )
-            if not shutil.which("tesseract"):
-                st.caption(
-                    (
-                        f"För OCR på skannade PDF-filer behöver du också Tesseract. {get_tesseract_install_hint()}"
-                        if lang == "sv"
-                        else f"Scanned PDF OCR also needs Tesseract. {get_tesseract_install_hint()}"
+            with st.expander(get_text("system_status_section"), expanded=False):
+                for check in checks:
+                    render_system_check(check, lang)
+                missing_python_packages = get_missing_python_packages()
+                if missing_python_packages:
+                    if st.button(
+                        "Installera saknade Python-paket" if lang == "sv" else "Install missing Python packages",
+                        use_container_width=True,
+                    ):
+                        with st.spinner("Installerar paket..." if lang == "sv" else "Installing packages..."):
+                            try:
+                                installed_package_names = install_missing_python_packages()
+                                package_list = ", ".join(installed_package_names)
+                                st.success(
+                                    f"Installerade: {package_list}"
+                                    if lang == "sv"
+                                    else f"Installed: {package_list}"
+                                )
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(
+                                    f"Kunde inte installera Python-paketen: {exc}"
+                                    if lang == "sv"
+                                    else f"Could not install the Python packages: {exc}"
+                                )
+                if not shutil.which("tesseract"):
+                    st.caption(
+                        (
+                            f"För OCR på skannade PDF-filer behöver du också Tesseract. {get_tesseract_install_hint()}"
+                            if lang == "sv"
+                            else f"Scanned PDF OCR also needs Tesseract. {get_tesseract_install_hint()}"
+                        )
                     )
-                )
-            if not basic_mode:
-                with st.expander("Tekniska detaljer" if lang == "sv" else "Technical details", expanded=False):
-                    for check in checks:
-                        st.caption(f"{check['name']}: {cleaned_ui_text(check['message'])}")
+                if not basic_mode:
+                    with st.expander("Tekniska detaljer" if lang == "sv" else "Technical details", expanded=False):
+                        for check in checks:
+                            st.caption(f"{check['name']}: {cleaned_ui_text(check['message'])}")
 
-        with st.expander("Models", expanded=True):
+        with st.expander(get_text("models_section"), expanded=not basic_mode):
             st.caption("Rekommendationer baserade på den här datorn." if lang == "sv" else "Recommendations based on this computer.")
             for preset in recommendations:
                 title = (
@@ -2721,7 +2760,7 @@ def main():
                         rebuild_from_current_pages()
                     st.rerun()
 
-        with st.expander("Files", expanded=True):
+        with st.expander(get_text("documents_section"), expanded=True):
             performance_mode = st.checkbox(
                 "Stort dokumentläge" if lang == "sv" else "Large-document mode",
                 value=st.session_state.get("performance_mode", False),
@@ -2741,7 +2780,16 @@ def main():
             if ocr_check:
                 st.caption(cleaned_ui_text(ocr_check.get("message", "")))
             uploaded_files = st.file_uploader(get_text("upload"), type=["pdf", "docx", "txt", "md"], accept_multiple_files=True, disabled=st.session_state.processing, help=get_text("upload_help"))
-            if uploaded_files and st.button(get_text("process_btn"), disabled=st.session_state.processing, use_container_width=True):
+            if uploaded_files:
+                st.success(get_text("selected_files").format(len(uploaded_files)))
+                st.caption(get_text("ready_to_build"))
+                preview_names = ", ".join(file.name for file in uploaded_files[:3])
+                if len(uploaded_files) > 3:
+                    preview_names += f" +{len(uploaded_files) - 3}"
+                st.caption(preview_names)
+            elif not st.session_state.get("docs"):
+                st.info(get_text("no_docs_hint"))
+            if uploaded_files and st.button(get_text("process_kb_btn"), disabled=st.session_state.processing, use_container_width=True):
                 ingest_uploaded_files(uploaded_files)
                 st.rerun()
             ingest_stats = st.session_state.get("last_ingest_stats", {})
@@ -2759,6 +2807,7 @@ def main():
             if st.session_state.get("docs"):
                 unique_sources = len(set(doc.metadata.get("source", "Unknown") for doc in st.session_state.get("raw_pages", [])))
                 st.info(get_text("chunks_loaded").format(len(st.session_state.docs), unique_sources))
+                st.caption(get_text("uploaded_sources"))
             for source in st.session_state.get("available_sources", []):
                 col_preview, col_remove = st.columns([3, 1])
                 with col_preview:
@@ -2768,6 +2817,7 @@ def main():
                     if st.button("X", key=f"remove-source-{source}", use_container_width=True):
                         remove_source(source)
                         st.rerun()
+        with st.expander(get_text("saved_work_section"), expanded=False):
             st.text_input("Namn på sparning" if lang == "sv" else "Save name", key="save_slot_name", help="Ge sparningen ett eget namn så att du kan ladda den senare." if lang == "sv" else "Give this save a name so you can load it later.")
             st.text_input("Case-mapp" if lang == "sv" else "Case folder", key="save_slot_folder", help="Till exempel granskning, intervju eller research." if lang == "sv" else "For example investigation, interview, or research.")
             st.text_input("Taggar" if lang == "sv" else "Tags", key="save_slot_tags", help="Separera med kommatecken." if lang == "sv" else "Separate with commas.")
@@ -3069,6 +3119,12 @@ def main():
                     st.rerun()
             with info_col:
                 st.caption("Klicka på en källhänvisning för att hoppa hit." if lang == "sv" else "Click a citation to jump here.")
+            if st.session_state.get("preview_origin") in {"citation", "register", "snippet"}:
+                st.info(
+                    "Källan du öppnade visas här till höger. Den markerade passagen visas under filnamnet."
+                    if lang == "sv"
+                    else "The source you opened appears here on the right. The highlighted passage is shown below the file name."
+                )
             if preview_excerpt:
                 st.markdown("**Markerad passage**" if lang == "sv" else "**Highlighted passage**")
                 st.markdown(
@@ -3077,36 +3133,43 @@ def main():
                 )
             st.text_area("Preview", selected_doc.page_content[:2500], height=220)
 
-    tab_chat, tab_summary, tab_write, tab_analysis, tab_board, tab_export = main_col_left.tabs(["Chat", "Sammanfatta" if lang == "sv" else "Summary", "Skrivstudio" if lang == "sv" else "Writing Studio", "Analys" if lang == "sv" else "Analysis", "Case board" if lang == "en" else "Case board", "Export"])
+    tab_chat, tab_summary, tab_write, tab_analysis, tab_board, tab_export = main_col_left.tabs([
+        "Chatt" if lang == "sv" else "Chat",
+        "Sammanfatta" if lang == "sv" else "Summary",
+        "Skrivstudio" if lang == "sv" else "Writing Studio",
+        "Analys" if lang == "sv" else "Analysis",
+        "Arbetsyta" if lang == "sv" else "Case board",
+        "Exportera" if lang == "sv" else "Export",
+    ])
 
     with tab_chat:
         render_page_header(
             get_text("chat_title"),
             get_text("chat_help"),
-            "Om Chat" if lang == "sv" else "About Chat",
+            "Om chatt" if lang == "sv" else "About Chat",
             (
                 "### Vad den gör\n"
-                "- Söker i dina uppladdade dokument.\n"
-                "- Försöker svara med källor när underlaget räcker.\n"
-                "- Visar varningar om något bör granskas manuellt.\n\n"
+                "- Söker automatiskt i alla uppladdade dokument.\n"
+                "- Svarar med källor när underlaget räcker.\n"
+                "- Säger tydligt när materialet inte räcker eller måste dubbelkollas.\n"
+                "- Kan fortfarande småprata och hjälpa till naturligt utan att hitta på fakta.\n\n"
                 "### Bra att veta\n"
-                "- Använd källfilter om du vill begränsa svaret till vissa filer.\n"
+                "- Alla uppladdade filer blir automatiskt en del av kunskapsbasen.\n"
                 "- Om svaret saknar tydliga källor bör du kontrollera originaldokumentet."
             )
             if lang == "sv"
             else
             (
                 "### What it does\n"
-                "- Searches your uploaded documents.\n"
-                "- Tries to answer with citations when the material is sufficient.\n"
-                "- Shows warnings when something should be reviewed manually.\n\n"
+                "- Automatically searches across all uploaded documents.\n"
+                "- Answers with citations when the material is sufficient.\n"
+                "- Clearly says when the material is insufficient or needs review.\n"
+                "- Still chats naturally without inventing facts.\n\n"
                 "### Good to know\n"
-                "- Use source filters to limit answers to certain files.\n"
+                "- Every uploaded file becomes part of the knowledge base automatically.\n"
                 "- If the answer lacks clear citations, check the original document."
             ),
         )
-        if st.session_state.get("available_sources"):
-            st.multiselect("Källfilter" if lang == "sv" else "Source filter", options=st.session_state.get("available_sources", []), key="chat_source_filter", help="Begränsa chatten till vissa dokument." if lang == "sv" else "Limit chat retrieval to selected documents.")
         st.markdown('<div class="chat-shell">', unsafe_allow_html=True)
         for idx, msg in enumerate(st.session_state.chat_history):
             if msg["role"] == "user":
@@ -3126,11 +3189,6 @@ def main():
                     )
                     render_confidence_banner(confidence, lang)
                     st.markdown(body)
-                    tools_left, tools_right = st.columns([1, 1])
-                    with tools_left:
-                        copy_block(msg["content"], key=f"copy-{idx}")
-                    with tools_right:
-                        st.download_button("Ladda ner svar" if lang == "sv" else "Download answer", data=msg["content"].encode("utf-8"), file_name=f"insikt-answer-{idx + 1}.txt", mime="text/plain", key=f"download-answer-{idx}")
                     render_citation_register(register, lang, key_prefix=f"history-{idx}")
                     if notes or message_issues:
                         st.markdown('<div class="chat-notes">', unsafe_allow_html=True)
@@ -3143,10 +3201,12 @@ def main():
                     render_source_snippets(message_sources, lang, key_prefix=f"history-{idx}")
         if prompt := st.chat_input(get_text("chat_input"), disabled=st.session_state.processing):
             st.session_state.chat_history.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
             with st.spinner("Tänker..." if lang == "sv" else "Thinking..."):
                 llm = load_llm(st.session_state.device_choice)
                 history_lc = [HumanMessage(content=m["content"]) if m["role"] == "user" else AIMessage(content=m["content"]) for m in st.session_state.chat_history[:-1]]
-                answer, sources, issues = rag_chat_with_docs(prompt, history_lc, st.session_state.vectorstore, llm, st.session_state.lang, source_filter=st.session_state.get("chat_source_filter") or None)
+                answer, sources, issues = rag_chat_with_docs(prompt, history_lc, st.session_state.vectorstore, llm, st.session_state.lang)
             st.session_state.chat_history.append({"role": "assistant", "content": answer, "sources": docs_to_records(sources), "issues": issues})
             body, notes = split_assistant_content(answer)
             body, register = prettify_citations_for_display(body or answer, lang)
@@ -3154,11 +3214,6 @@ def main():
                 confidence = assess_answer_confidence(answer, sources, issues, lang)
                 render_confidence_banner(confidence, lang)
                 st.markdown(body)
-                tools_left, tools_right = st.columns([1, 1])
-                with tools_left:
-                    copy_block(answer, key="copy-latest")
-                with tools_right:
-                    st.download_button("Ladda ner svar" if lang == "sv" else "Download answer", data=answer.encode("utf-8"), file_name="insikt-answer-latest.txt", mime="text/plain", key="download-answer-latest")
                 render_citation_register(register, lang, key_prefix="latest")
                 if notes or issues:
                     st.markdown('<div class="chat-notes">', unsafe_allow_html=True)
@@ -3291,7 +3346,7 @@ def main():
                 "- Kan skapa artikel, manus eller dokumentärupplägg.\n\n"
                 "### Bra att veta\n"
                 "- Dokumentär-pipeline kör i flera steg: disposition, scenlista och slutligt manus.\n"
-                "- Källfilter hjälper dig hålla texten till rätt dokument."
+                "- Alla uppladdade dokument används automatiskt som underlag."
             )
             if lang == "sv"
             else
@@ -3302,7 +3357,7 @@ def main():
                 "- Can create articles, scripts, or documentary-style drafts.\n\n"
                 "### Good to know\n"
                 "- The documentary pipeline runs in stages: outline, scene list, and final script.\n"
-                "- Source filters help keep the draft tied to the right documents."
+                "- All uploaded documents are used automatically as source material."
             ),
         )
         if st.session_state.get("reporter_template") in REPORTER_TEMPLATES:
@@ -3322,11 +3377,9 @@ def main():
             length_key = st.selectbox(get_text("writing_length"), options=list(WRITING_LENGTHS.keys()), format_func=lambda x: WRITING_LENGTHS[x]["sv"] if lang == "sv" else WRITING_LENGTHS[x]["en"], key="writing_length")
         use_sources = st.checkbox(get_text("writing_use_sources"), value=st.session_state.get("writing_use_sources", True), key="writing_use_sources")
         use_pipeline = st.checkbox(get_text("writing_pipeline"), value=st.session_state.get("writing_pipeline", False), key="writing_pipeline", help=get_text("writing_pipeline_help"))
-        if st.session_state.get("available_sources"):
-            st.multiselect("Källfilter" if lang == "sv" else "Source filter", options=st.session_state.get("available_sources", []), key="writing_source_filter", help="Begränsa skrivutkastet till vissa dokument." if lang == "sv" else "Limit the draft to selected documents.")
         if st.button(get_text("writing_generate"), disabled=st.session_state.processing or not brief):
             llm = load_llm(st.session_state.device_choice)
-            result, used_sources = rag_generate_writing(brief, WRITING_ROLES[role_key]["sv" if lang == "sv" else "en"], WRITING_FORMATS[format_key]["sv" if lang == "sv" else "en"], WRITING_TONES[tone_key]["sv" if lang == "sv" else "en"], WRITING_LENGTHS[length_key]["words"], lang, st.session_state.vectorstore, llm, use_sources=use_sources, use_pipeline=use_pipeline, source_filter=st.session_state.get("writing_source_filter") or None)
+            result, used_sources = rag_generate_writing(brief, WRITING_ROLES[role_key]["sv" if lang == "sv" else "en"], WRITING_FORMATS[format_key]["sv" if lang == "sv" else "en"], WRITING_TONES[tone_key]["sv" if lang == "sv" else "en"], WRITING_LENGTHS[length_key]["words"], lang, st.session_state.vectorstore, llm, use_sources=use_sources, use_pipeline=use_pipeline)
             st.session_state.writing_result = result
             st.session_state.writing_sources = used_sources
         if st.session_state.get("writing_result"):
@@ -3491,9 +3544,9 @@ def main():
 
     with tab_board:
         render_page_header(
-            "Case board" if lang == "en" else "Case board",
+            "Arbetsyta" if lang == "sv" else "Case board",
             "Samla arbetsnoter, personer, datum, utdrag och vinklar på ett ställe." if lang == "sv" else "Collect working notes, people, dates, excerpts, and angles in one place.",
-            "Om Case board" if lang == "sv" else "About Case board",
+            "Om arbetsyta" if lang == "sv" else "About Case board",
             (
                 "### Vad den gör\n"
                 "- Samlar dina viktigaste arbetsnoter.\n"
@@ -3575,7 +3628,7 @@ def main():
         render_page_header(
             get_text("export_title"),
             "",
-            "Om Export" if lang == "sv" else "About Export",
+            "Om export" if lang == "sv" else "About Export",
             (
                 "### Vad den gör\n"
                 "- Låter dig ladda ner sammanfattningen i flera format.\n"

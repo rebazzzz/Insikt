@@ -16,6 +16,10 @@ class RagTests(unittest.TestCase):
         citations = extract_citations_from_response("Claim [Source: report.pdf, page 2]")
         self.assertEqual(citations[0]["page"], "2")
 
+    def test_prompt_without_docs_mentions_no_uploaded_documents(self):
+        prompt = create_chat_prompt([HumanMessage(content="Hi")], [], "Can you help me brainstorm?", "en")
+        self.assertIn("There are no uploaded documents available right now.", prompt)
+
     def test_verify_citations_passes_known_source(self):
         docs = [Document(page_content="x", metadata={"source": "report.pdf", "page": "2"})]
         _, issues = verify_citations("Claim [Source: report.pdf, page 2]", docs, "en")
@@ -41,11 +45,18 @@ class RagTests(unittest.TestCase):
             "en",
         )
         self.assertEqual(result["level"], "well_supported")
+        self.assertGreaterEqual(result["score"], 60)
 
     def test_confidence_needs_review_without_citations(self):
         docs = [Document(page_content="Budget fraud details", metadata={"source": "report.pdf", "page": "2"})]
         result = assess_answer_confidence("Claim without support", docs, ["missing_citations"], "en")
         self.assertEqual(result["level"], "needs_review")
+        self.assertLess(result["score"], 40)
+
+    def test_confidence_without_docs_is_low(self):
+        result = assess_answer_confidence("Happy to chat, but I cannot verify facts here.", [], ["no_knowledge_base"], "en")
+        self.assertEqual(result["level"], "needs_review")
+        self.assertLess(result["score"], 20)
 
 
 if __name__ == "__main__":
